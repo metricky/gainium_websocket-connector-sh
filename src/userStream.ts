@@ -84,7 +84,7 @@ import {
   isExchangeEnabled,
   onAdminConfigChange,
 } from './utils/adminConfig'
-import RedisClient from './utils/redis'
+import RedisClient, { RedisWrapper } from './utils/redis'
 import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
 import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
@@ -561,13 +561,15 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   true,
 )
 
+const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
+
 class UserConnector {
   private krakenLastUpdate: { spot: number; usdm: number } = {
     spot: 0,
     usdm: 0,
   }
-  private redisSet = RedisClient.getInstance()
-  private redis = RedisClient.getInstance()
+  private redisSet: RedisWrapper | null = null
+  private redis: RedisWrapper | null = null
   private rabbit = new Rabbit()
   private testMode: boolean
   /** Array of users for whom binance stream are opened */
@@ -585,6 +587,20 @@ class UserConnector {
   private coinbaseErrors: Map<string, Map<string, number>> = new Map()
   /** Kucoin errors */
   private kucoinErrors: Map<string, number> = new Map()
+  /** Rolling-window reconnect timestamps per `${exchange}:${id}`, for the
+   *  user-stream flap detector (noteReconnect). Emit-only telemetry. */
+  private streamFlaps: Map<string, number[]> = new Map()
+  /** Sliding-window timestamps of Binance auth-rejections (-2015/-2014/-2008 /
+   *  HTTP 401) per room id. A rejected key/IP/permission never recovers by
+   *  reconnecting, so once enough land inside the window we circuit-break
+   *  instead of looping every ~60s. A time window (not a consecutive counter)
+   *  because the failing WS-API frames also flow through the normal event path,
+   *  which would otherwise reset a consecutive counter every cycle. */
+  private binanceAuthErrors: Map<string, number[]> = new Map()
+  /** Rooms in an auth-rejection cooldown: id → epoch-ms when a retry is
+   *  allowed. While in cooldown we neither reopen the stream nor emit a flap
+   *  alert for the room (it's a user credential problem, not dead infra). */
+  private authCooldownUntil: Map<string, number> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -613,6 +629,11 @@ class UserConnector {
   private heartbeatSec = +(process.env.USER_STREAM_HL_HEARTBEAT_SEC ?? '30')
   private hlBalancer = HyperliquidBalancer.getInstance()
   private workerHeartbeatTimer: NodeJS.Timeout | null = null
+  /** Per-room last user-stream-event time + last forced re-subscribe time,
+   *  for the opt-in liveness guard (see startLivenessGuard). */
+  private lastEventAt: Map<string, number> = new Map()
+  private lastResubAt: Map<string, number> = new Map()
+  private livenessTimer: NodeJS.Timeout | null = null
   /** Constructor method
    * Determine class variables
    * Start server
@@ -644,19 +665,27 @@ class UserConnector {
         )
       }
       this.setupRabbit()
+      this.intiRedis()
       if (this.role === 'worker') {
         void this.startWorkerHeartbeat()
       } else if (this.role === 'balancer') {
         void this.hlBalancer.init()
       }
-      this.redis?.publish(
-        serviceLogRedis,
-        JSON.stringify({ restart: 'userStream' }),
-      )
+
       if (isAdminConfigEnabled()) {
         onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
       }
+      this.startLivenessGuard()
     }
+  }
+
+  private async intiRedis() {
+    this.redis = await RedisClient.getInstance()
+    this.redisSet = await RedisClient.getInstance()
+    this.redis?.publish(
+      serviceLogRedis,
+      JSON.stringify({ restart: 'userStream' }),
+    )
   }
 
   /**
@@ -686,6 +715,128 @@ class UserConnector {
   }
 
   /**
+   * Opt-in per-account liveness guard (USER_STREAM_LIVENESS_ENABLED=true).
+   *
+   * Born from the paper user-stream "connected-but-dead" class (community
+   * thread 4863 follow-up): a room can sit in `this.users` looking healthy
+   * while its upstream (paper socket / exchange WS) silently delivers nothing,
+   * so the bot only learns its fills via the reconcile sweep (2-5 min lag).
+   *
+   * This periodically force-recreates ONE account's stream at a time once it
+   * has gone quiet beyond a threshold — never a global "reload all" (that soft
+   * fix was tried and reverted). Conservative by construction: per-account,
+   * cooldown-gated, capped per scan, paper-only by default (live exchange WS
+   * churn needs a settle delay), and dark unless explicitly enabled.
+   */
+  private startLivenessGuard() {
+    if (process.env.USER_STREAM_LIVENESS_ENABLED !== 'true' || this.testMode) {
+      return
+    }
+    const scanMs = Math.max(
+      30_000,
+      +(process.env.USER_STREAM_LIVENESS_SCAN_MS ?? 120_000),
+    )
+    const staleMs = Math.max(
+      60_000,
+      +(process.env.USER_STREAM_LIVENESS_STALE_MS ?? 1_200_000),
+    )
+    const cooldownMs = Math.max(
+      staleMs,
+      +(process.env.USER_STREAM_LIVENESS_COOLDOWN_MS ?? 3_600_000),
+    )
+    const maxPerScan = Math.max(
+      1,
+      +(process.env.USER_STREAM_LIVENESS_MAX_PER_SCAN ?? 15),
+    )
+    const paperOnly = process.env.USER_STREAM_LIVENESS_PAPER_ONLY !== 'false'
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer)
+    }
+    this.livenessTimer = setInterval(() => {
+      try {
+        this.scanLiveness({ staleMs, cooldownMs, maxPerScan, paperOnly })
+      } catch (e) {
+        this.logger(`liveness scan failed: ${(e as Error).message}`, true)
+      }
+    }, scanMs)
+    this.logger(
+      `user-stream liveness guard armed (scan ${scanMs}ms, stale ${staleMs}ms, cooldown ${cooldownMs}ms, cap ${maxPerScan}, paperOnly ${paperOnly})`,
+    )
+  }
+
+  private scanLiveness(opts: {
+    staleMs: number
+    cooldownMs: number
+    maxPerScan: number
+    paperOnly: boolean
+  }) {
+    const now = Date.now()
+    let kicked = 0
+    for (const user of this.users) {
+      if (kicked >= opts.maxPerScan) {
+        break
+      }
+      if (user.pending) {
+        continue
+      }
+      if (opts.paperOnly && !paperExchanges.includes(user.provider)) {
+        continue
+      }
+      const last = this.lastEventAt.get(user.id) ?? 0
+      if (now - last < opts.staleMs) {
+        continue
+      }
+      const lastResub = this.lastResubAt.get(user.id) ?? 0
+      if (now - lastResub < opts.cooldownMs) {
+        continue
+      }
+      kicked++
+      void this.forceResubscribe(user.id, Math.round((now - last) / 1000))
+    }
+    if (kicked) {
+      this.logger(`liveness guard re-subscribed ${kicked} stale account(s)`)
+    }
+  }
+
+  /**
+   * Tear down and re-create a single account's stream while preserving its
+   * subscriber refcount. Reuses the tested open path so the recreate matches
+   * a normal subscribe; stamps lastResubAt so the cooldown holds.
+   */
+  private async forceResubscribe(id: string, staleSec: number) {
+    const msg = this.subscribeMsgsMap.get(id)
+    const user = this.users.find((u) => u.id === id)
+    if (!msg || !user) {
+      return
+    }
+    const refcount = this.subscribersMap.get(id) ?? 1
+    this.lastResubAt.set(id, Date.now())
+    this.logger(
+      `liveness guard: re-subscribing ${id} (${user.provider}) — no events for ${staleSec}s`,
+    )
+    try {
+      user.close()
+    } catch (e) {
+      this.logger(`liveness close threw for ${id}: ${e}`, true)
+    }
+    this.users = this.users.filter((u) => u.id !== id)
+    this.subscribersMap.delete(id)
+    try {
+      await this.openStreamCallback(msg, id)
+    } catch (e) {
+      this.logger(
+        `liveness re-subscribe failed for ${id}: ${(e as Error).message}`,
+        true,
+      )
+    }
+    // openStreamCallback resets the count to 1; restore the real subscriber
+    // count so a later 'close stream' doesn't prematurely tear the room down.
+    this.subscribersMap.set(id, refcount)
+    // Grace period before this room can be a candidate again.
+    this.lastEventAt.set(id, Date.now())
+  }
+
+  /**
    * Worker mode: announce a fresh boot epoch and refresh a TTL'd
    * heartbeat key every `heartbeatSec`. The balancer reads these
    * to detect death (TTL expiry) and restart (boot-epoch change).
@@ -702,13 +853,15 @@ class UserConnector {
         `userStream:worker:${this.workerId}:boot`,
         bootEpoch,
       )
-      await this.redisSet?.set(`userStream:worker:${this.workerId}:hb`, '1', {
-        EX: ttl,
-      })
+      await this.redisSet?.set(
+        `userStream:worker:${this.workerId}:hb`,
+        '1',
+        ttl,
+      )
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:cap`,
         `${hlCap}`,
-        { EX: ttl },
+        ttl,
       )
       await this.publishWorkerUserList(ttl)
     } catch (e) {
@@ -718,10 +871,10 @@ class UserConnector {
     let tick = 0
     this.workerHeartbeatTimer = setInterval(() => {
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:hb`, '1', { EX: ttl })
+        ?.set(`userStream:worker:${this.workerId}:hb`, '1', ttl)
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, { EX: ttl })
+        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, ttl)
         .catch((e) => this.logger(`Worker cap publish failed: ${e}`, true))
       this.publishWorkerUserList(ttl).catch((e) =>
         this.logger(`Worker user-list publish failed: ${e}`, true),
@@ -764,7 +917,7 @@ class UserConnector {
     await this.redisSet.set(
       `userStream:worker:${this.workerId}:users`,
       JSON.stringify(ids),
-      { EX: ttl },
+      ttl,
     )
   }
 
@@ -779,8 +932,9 @@ class UserConnector {
       uuid: string
     }
     type RabbitCloseMsg = { event: 'close stream'; uuid: string }
+    type RabbitForceRestartMsg = { event: 'force restart stream'; uuid: string }
     this.rabbit?.listenWithCallback<
-      RabbitOpenMsg | RabbitCloseMsg,
+      RabbitOpenMsg | RabbitCloseMsg | RabbitForceRestartMsg,
       WorkerOpenResponse | undefined
     >(
       queue,
@@ -837,6 +991,9 @@ class UserConnector {
           if (this.role === 'worker') {
             return { accepted: true, workerId: this.workerId }
           }
+        }
+        if (msg.event === 'force restart stream') {
+          this.restartStreams(msg.uuid)
         }
         return undefined
       },
@@ -932,6 +1089,59 @@ class UserConnector {
     client.on('exception', () => null)
     client.on('update', () => null)
   }
+  /**
+   * User-stream flap detector. A single reconnect is healthy auto-recovery;
+   * *repeated* reconnects (or forced error-threshold restarts) in a short
+   * window are the "connected but dead" fingerprint Maksym described (Q7) —
+   * the only reliable liveness signal we have, since most exchanges post by
+   * event, not interval. When the count crosses the threshold we emit a
+   * structured event to the existing `serviceLog` Redis channel; main-app's
+   * consumer forwards it to the admin watchdog (same pipeline as the price
+   * data-stall alert). Strictly emit-only: it never throws and never alters
+   * stream control flow.
+   */
+  private noteReconnect(id: string, exchange: string) {
+    try {
+      // Don't page on reconnect churn for a room we've already flagged as
+      // auth-rejected — that's a user credential problem the circuit-breaker is
+      // handling, not a "connected but dead" stream. Suppresses from the first
+      // observed auth error, before the cooldown even arms.
+      if (
+        (this.binanceAuthErrors.get(id)?.length ?? 0) > 0 ||
+        (this.authCooldownUntil.get(id) ?? 0) > Date.now()
+      ) {
+        return
+      }
+      const windowMs =
+        Number(process.env.USER_STREAM_FLAP_WINDOW_MS) || 10 * 60 * 1000
+      const threshold = Number(process.env.USER_STREAM_FLAP_THRESHOLD) || 4
+      const key = `${exchange}:${id}`
+      const now = Date.now()
+      const hits = (this.streamFlaps.get(key) ?? []).filter(
+        (t) => now - t < windowMs,
+      )
+      hits.push(now)
+      if (hits.length >= threshold) {
+        // Reset so we alert once per burst, not on every subsequent reconnect.
+        this.streamFlaps.delete(key)
+        this.redis?.publish(
+          'serviceLog',
+          JSON.stringify({
+            userStreamFlap: {
+              exchange,
+              userId: id,
+              reconnects: hits.length,
+              windowSec: Math.round(windowMs / 1000),
+            },
+          }),
+        )
+      } else {
+        this.streamFlaps.set(key, hits)
+      }
+    } catch {
+      // emit-only: a counter/publish failure must never affect the stream
+    }
+  }
 
   /** Open stream callback
    * Check if stream for this user is already opened
@@ -1009,6 +1219,20 @@ class UserConnector {
           `${userId}${api.key}${api.secret}${api.provider}${api.passphrase}${api.keysType}${api.okxSource}`,
         )
         .digest('hex')
+    // Auth-rejection cooldown: a key Binance rejected (-2015 etc.) is
+    // circuit-broken — don't reopen until the cooldown elapses, regardless of
+    // who requests it (self-retry, main-app health loop, bot restart). A
+    // regenerated key hashes to a different `id`, so this only gates the exact
+    // rejected credential and never blocks a fixed key.
+    const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
+    if (cooldownUntil > Date.now()) {
+      return this.logger(
+        `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
+          (cooldownUntil - Date.now()) / 1000,
+        )}s`,
+        true,
+      )
+    }
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1020,7 +1244,6 @@ class UserConnector {
       }
       this.saveUser(findUser)
     } else if (findUser && findUser.pending) {
-      this.logger(`waiting for 500ms to process ${api.provider}`)
       findUser.timer = setTimeout(async () => {
         const findUser = this.users.find((user) => user.id === id)
         if (findUser) {
@@ -1171,6 +1394,7 @@ class UserConnector {
         }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
         client.on('reconnected', (data) => {
           this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
+          this.noteReconnect(id, api.provider)
         })
         client.on('close', (data) => {
           this.logger(`${id} ws has closed ${data.wsKey} ${api.provider}`)
@@ -1188,6 +1412,70 @@ class UserConnector {
             `${id} ${userId} ws saw error ${data?.wsKey} ${errorMsg} ${api.provider}`,
             true,
           )
+          // Auth-rejection circuit-breaker. A rejected key/IP/permission
+          // (-2015 invalid key/IP/perms, -2014 bad key format, -2008 invalid
+          // key, or a raw HTTP 401) will NOT recover by reconnecting — retrying
+          // every ~60s just burns Binance weight, holds the shared
+          // `openStream<provider>` mutex against healthy users, and trips the
+          // user-stream flap watchdog. After a small run of consecutive auth
+          // errors, stop and back off instead of resubscribing.
+          const wsErr: any = data ?? {}
+          const authCode = Number(wsErr?.error?.code ?? wsErr?.code)
+          const isAuthReject =
+            [-2015, -2014, -2008].includes(authCode) ||
+            Number(wsErr?.status) === 401
+          if (isAuthReject) {
+            const windowMs = Math.max(
+              60_000,
+              Number(process.env.USER_STREAM_AUTH_WINDOW_MS) || 10 * 60 * 1000,
+            )
+            const threshold =
+              Number(process.env.USER_STREAM_AUTH_FAIL_THRESHOLD) || 3
+            const now = Date.now()
+            const hits = (this.binanceAuthErrors.get(id) ?? []).filter(
+              (t) => now - t < windowMs,
+            )
+            hits.push(now)
+            if (hits.length < threshold) {
+              this.binanceAuthErrors.set(id, hits)
+              return
+            }
+            const cooldownMs = Math.max(
+              60_000,
+              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
+                30 * 60 * 1000,
+            )
+            this.authCooldownUntil.set(id, now + cooldownMs)
+            this.binanceAuthErrors.delete(id)
+            this.binanceErrors.delete(id)
+            await stopMethod()
+            this.users = this.users.filter((u) => u.id !== id)
+            const subs = this.subscribersMap.get(id)
+            this.subscribersMap.delete(id)
+            this.logger(
+              `${id} ${userId} Binance key rejected (code ${
+                authCode || 401
+              }); circuit-broken for ${Math.round(
+                cooldownMs / 1000,
+              )}s — no reconnect, no flap alert`,
+              true,
+            )
+            // One delayed retry after the cooldown so a key fixed in place
+            // (e.g. egress IP added to the whitelist without regenerating the
+            // key) self-heals without a bot restart. If it's still rejected,
+            // this handler simply re-arms the cooldown.
+            if (subs) {
+              setTimeout(() => {
+                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+                  this.authCooldownUntil.delete(id)
+                  ;[...Array(subs)].forEach(() =>
+                    this.openStreamCallback(msg, uuid),
+                  )
+                }
+              }, cooldownMs)
+            }
+            return
+          }
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
           if ((this.binanceErrors.get(id) ?? 0) >= 2) {
             await stopMethod()
@@ -1299,6 +1587,7 @@ class UserConnector {
 
                 this.kucoinErrors.delete(id)
                 this.logger(`Restart due to Kucoin error ${id}`, true)
+                this.noteReconnect(id, api.provider)
               }
             }
           }
@@ -1574,6 +1863,7 @@ class UserConnector {
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
             )
+            this.noteReconnect(id, api.provider)
           })
           const close = () => {
             this.closeBybitConnection(client)
@@ -1824,6 +2114,7 @@ class UserConnector {
 
                 this.okxErrors.delete(id)
                 this.logger(`restart connection ${id} ${api.provider}`)
+                this.noteReconnect(id, api.provider)
               }
             },
           )
@@ -1914,6 +2205,7 @@ class UserConnector {
 
               this.coinbaseErrors.delete(id)
               this.logger(`restart connection ${id} ${api.provider}`)
+              this.noteReconnect(id, api.provider)
             }
           })
 
@@ -1952,6 +2244,7 @@ class UserConnector {
 
               this.coinbaseErrors.delete(id)
               this.logger(`restart connection ${id} ${api.provider}`)
+              this.noteReconnect(id, api.provider)
             }
           })
           client.ws.connect()
@@ -2083,6 +2376,7 @@ class UserConnector {
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
             )
+            this.noteReconnect(id, api.provider)
           })
           const close = () => {
             this.closeBitgetConnection(client)
@@ -2406,6 +2700,7 @@ class UserConnector {
 
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+            this.noteReconnect(id, api.provider)
           })
 
           const close = () => {
@@ -2513,6 +2808,9 @@ class UserConnector {
       return
     }
     this.subscribeMsgsMap.set(id, msg)
+    // Seed liveness clock on (re)subscribe so a freshly-created room gets a
+    // grace period before the liveness guard can consider it stale.
+    this.lastEventAt.set(id, Date.now())
     this.logUserState()
 
     if (!this.testMode) {
@@ -2590,13 +2888,12 @@ class UserConnector {
   }
 
   @IdMute(mutex, () => 'restartStreams')
-  public async restartStreams() {
+  private async restartStreams(uuid?: string) {
     let c = 0
-    for (const user of this.users) {
+    for (const user of this.users.filter((u) =>
+      uuid ? u.id === uuid : true,
+    )) {
       c++
-      if (paperExchanges.includes(user.provider)) {
-        continue
-      }
       const count = this.subscribersMap.get(user.id) || 0
       const msg = this.subscribeMsgsMap.get(user.id)
       if (count && msg) {
@@ -2608,10 +2905,14 @@ class UserConnector {
           await this.openStreamCallback(msg, undefined)
         }
         this.logger(
-          `Restarted ${c} of ${this.users.length} ${user.id} ${msg.userId}`,
+          `Restarted ${c}${uuid ? '' : ` of ${this.users.length} `}${user.id} ${msg.userId}`,
         )
       }
     }
+  }
+
+  private async removeAccountFromWatchlist(accountId: string) {
+    await this.redis?.zRem(LAST_STREM_EVENT_TIME_KEY, accountId)
   }
 
   /** Close stream callback
@@ -2628,6 +2929,7 @@ class UserConnector {
     if (uuid) {
       const find = this.subscribersMap.get(uuid)
       if (!find) {
+        this.removeAccountFromWatchlist(uuid)
         return this.logger(`${uuid} has no subscribers`, true)
       }
       const left = find - 1
@@ -2640,6 +2942,7 @@ class UserConnector {
           try {
             user.close()
           } catch (err) {
+            this.removeAccountFromWatchlist(uuid)
             /** Catch error and emit to bot */
             return this.logger(err, true)
           }
@@ -2651,11 +2954,13 @@ class UserConnector {
           this.logger(`User ${uuid} stream was closed`)
           this.onAfterCloseStream(uuid)
         } else {
+          this.removeAccountFromWatchlist(uuid)
           return this.logger(`User ${uuid} not found`, true)
         }
       } else {
         this.logger(`${uuid} unsubscribed event`)
       }
+      this.removeAccountFromWatchlist(uuid)
       return
     }
   }
@@ -2674,10 +2979,37 @@ class UserConnector {
     if (!streamMsg) {
       return
     }
+    // Liveness signal: this room delivered an event. Used by the liveness
+    // guard to tell a silently-dead stream from a healthy one.
+    this.lastEventAt.set(id, Date.now())
+    // A *genuine account event* proves the key is authorized — clear any
+    // auth-rejection state so a recovered account isn't held back. Gate on real
+    // order/balance event types: an unauthorized stream never delivers these,
+    // and the failing WS-API frames (which also flow through here) must NOT
+    // count as "recovered" — that was the bug that let a rejected key reset its
+    // own auth-error window every reconnect cycle so it never circuit-broke.
+    const authOkEvent = (streamMsg as { eventType?: string })?.eventType
+    if (
+      authOkEvent === 'executionReport' ||
+      authOkEvent === 'outboundAccountPosition' ||
+      authOkEvent === 'outboundAccountInfo' ||
+      authOkEvent === 'balanceUpdate' ||
+      authOkEvent === 'ORDER_TRADE_UPDATE' ||
+      authOkEvent === 'ACCOUNT_UPDATE' ||
+      authOkEvent === 'ACCOUNT_CONFIG_UPDATE'
+    ) {
+      if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
+      if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
+    }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
     if (!this.testMode) {
-      this.redis.publish(id, JSON.stringify(streamMsg))
+      this.redis?.publish(id, JSON.stringify(streamMsg))
+      this.redis?.zAdd(
+        LAST_STREM_EVENT_TIME_KEY,
+        { score: Date.now(), value: id },
+        true,
+      )
     } else {
       console.log('Stream Event:', JSON.stringify(streamMsg, null, 2))
     }

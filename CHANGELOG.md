@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-07-05
+
+### Fixed
+
+- Auth-rejection circuit-breaker (1.11.2) never actually tripped: the failing WS-API frames also flow through the normal `userStreamEvent` path, whose "recovered" clear reset the consecutive auth-error counter every reconnect cycle, so it never reached the threshold (verified on prod — a key with 5 consecutive `-2015`s still looped). Now (a) the auth-error tracker is a **time window** (default 3 within `USER_STREAM_AUTH_WINDOW_MS`=10min) that interleaved frames can't silently reset, and (b) the recovery-clear is gated to **genuine account events** (`executionReport`/`outboundAccountPosition`/`balanceUpdate`/`ORDER_TRADE_UPDATE`/`ACCOUNT_UPDATE`/…) so a rejected key can no longer count its own error frames as recovery. Cooldown/self-retry behaviour unchanged.
+
+### Fixed
+
+- Binance user-stream auth-rejection loop: a rejected API key (`-2015` invalid key/IP/permissions, `-2014`/`-2008`, or HTTP 401) made the WS-API session reconnect every ~60s indefinitely (observed 11 days on one account) — burning Binance request weight, holding the shared per-provider `openStream<provider>` mutex against healthy users, and tripping the user-stream flap watchdog with misleading "connected but dead" pages. Added a circuit-breaker: after `USER_STREAM_AUTH_FAIL_THRESHOLD` (3) consecutive auth errors the room stops and backs off for `USER_STREAM_AUTH_COOLDOWN_MS` (30min) instead of resubscribing, with a single self-retry after the cooldown so a key fixed in place (e.g. egress IP whitelisted without regenerating) self-heals. Flap alerts are suppressed from the first auth error for that room. Auth state clears on the next delivered user-data event; a regenerated key hashes to a new room id and is never gated.
+
+## [1.11.1] - 2026-07-05
+
+### Fixed
+
+- Candle watchdog crash-loop (bybit, binance, okx): the candle liveness signal (`lastDataTrade`) only advanced on *confirmed* (closed) candles, so any candle subscription on an interval ≥~2min looked stalled between closes and the watchdog crash-looped the worker every ~5min (chronic since v1.5.4's confirmed-only change; bybit was actively tripping, binance/okx were latent — kept fresh only by short-interval subs). Liveness now advances on every kline frame (confirmed or not) in all three; publishing stays confirmed-only, so downstream data is unchanged. bitget/kraken/kucoin/hyperliquid were never gated and are unaffected.
+
+### Changed
+
+- Stall isolation: on a candle stall, `BybitConnector` now restarts only its candle streams (targeted `handleStall` recovery) instead of throwing and crashing the whole worker (which also dropped ticker feeds and every other bybit market). Bounded to `maxTargetedRestarts` (2) between real data events before escalating to the previous full-worker restart, so a genuinely dead worker is still recovered. Other connectors keep the throw-based behavior unchanged.
+
+## [1.11.0] - 2026-07-04
+
+### Changed
+
+- Hyperliquid: Unit-bridged spot bases now normalize to their canonical ticker (`UETH→ETH`, `USOL→SOL`, …), derived authoritatively from `spotMeta` `fullName` (never a blanket `U` strip). The raw Unit pair is dual-registered so streams requested under the pre-normalization pair still resolve.
+
+### Fixed
+
+- Hyperliquid: spot candle subscriptions on a display name shared by a perp (e.g. `BTC-USDC`, and the newly-normalized `ETH-USDC`/`SOL-USDC`) now resolve to the spot `@N` stream instead of the perp — futures candles are no longer served to spot bots.
+
+## [1.10.0] - 2026-07-04
+
 ### Added
+- Price/candle data-stall observability: the price connector's per-channel watchdog now publishes a `{ watchdogStall }` event to the `serviceLog` Redis channel before it self-restarts, so the otherwise-silent recovery is visible to the admin watchdog (Telegram/email).
+- User-stream flap detector: a rolling-window reconnect counter per exchange+user (`noteReconnect`) emits a `{ userStreamFlap }` event to `serviceLog` once reconnects cross `USER_STREAM_FLAP_THRESHOLD` (default 4) within `USER_STREAM_FLAP_WINDOW_MS` (default 10 min) — the "connected but dead" signal. Hooked at the reconnect/forced-reconnect sites of Binance, Bybit, Bitget, Kraken, KuCoin, OKX, Coinbase. Strictly emit-only.
+- Opt-in per-account user-stream liveness guard (`USER_STREAM_LIVENESS_ENABLED=true`, dark by default): periodically force-recreates a single account's stream when it has delivered no events for `USER_STREAM_LIVENESS_STALE_MS` (default 20 min), healing the "connected but dead" paper/exchange bridge that otherwise leaves bots relying on the reconcile sweep. Per-account (never a global reload — that was reverted), cooldown-gated (`USER_STREAM_LIVENESS_COOLDOWN_MS`, default 60 min), capped per scan (`USER_STREAM_LIVENESS_MAX_PER_SCAN`, default 15), scan interval `USER_STREAM_LIVENESS_SCAN_MS` (default 2 min), paper-only unless `USER_STREAM_LIVENESS_PAPER_ONLY=false`.
 
 ### Changed
 
@@ -15,9 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-### Fixed
-
 ### Security
+
+## [1.10.0] - 2026-07-03
+
+### Added
+- User Stream Watchdog. 
+
+## [1.9.4] - 2026-06-24
+
+### Fixed
+- HL balancer: load per-worker caps from Redis at `init()`, not only on the 30s watchdog tick. A multi-IP worker (e.g. 6 IPs → cap 60) was undersized to `defaultWorkerCap` (10) right after boot, so the balancer dropped/self-routed every HL open past 10 until the first tick.
+- HL balancer: never open HL locally. `route()` now always claims an HL `open stream` once enabled (even when routing fails — no worker yet / all at cap); a failed route is logged and left for main-app to retry. Previously a failed route fell through and the balancer self-opened the HL stream, double-binding IPs it shares with the worker and hitting its own default 10-cap.
 
 ## [1.9.3] - 2026-06-10
 
