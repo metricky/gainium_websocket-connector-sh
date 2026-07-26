@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-07-25
+
+### Fixed
+
+- **Hyperliquid park-and-retry silently resolved to NOTHING — the v1.12.0 missed-fill fix has been inert since v1.12.1.** Two defects introduced together in `96c5d89` (v1.12.1) disabled both fallback rungs of the fill resolver, so any parked FILLED whose `userFills` never reached the buffer was dropped exactly as before v1.12.0: order stays `NEW`, deal silently freezes. Only the buffer rung has been working for two releases.
+  - **REST rung never ran.** `hlRestLookupOrder`'s precondition guard read `if (!url || !ctx.key || ctx.exchange)` — `ctx.exchange` is `'hyperliquid'`, always truthy, so the guard fired on *every* call and returned `null` before issuing the request. The balancer `/order` lookup was dead code. Missing `!`.
+  - **limitPx rung never ran.** v1.12.1 removed the final `emit(buildEvent(order, []))` from `resolve()` (per its "Do not sent raw limitPx" change) but left both log lines still announcing `emitting at limitPx (LAST RESORT)`, the module header documenting step 3, and the tests asserting it. The resolver logged an emit that never happened.
+  - **Now: REST is retried before limitPx is ever reached.** `restLookup` runs up to `HL_FILL_REST_RETRIES` (default 3) times with exponential backoff (`HL_FILL_REST_RETRY_DELAY_MS`, default 1000ms, doubling), so a transient balancer/exchange blip no longer costs us the real fill price. limitPx is emitted only once every attempt is spent (worst case ~8s after the FILLED: 5s grace + 1s + 2s). This deliberately re-introduces a bounded limitPx last resort that v1.12.1 removed — the tradeoff is one slightly-off average price versus a permanently frozen deal, now reached only after the retry ladder rather than on the first REST error. **Revisits Maksym's v1.12.1 price-accuracy call (ClickUp 86ey5zc49 §1) — flag for his review.**
+  - **Parked entries stay in the map for the whole ladder** (previously deleted up front, before the `await`). `has()` therefore keeps reporting `true` across the REST backoff, so reconnect-snapshot `userFills` for that cloid are still accepted instead of being dropped by the snapshot gate — and the buffer is re-checked before every REST attempt and once more immediately before the limitPx emit, so late-arriving fills always win on price. Single-emit is preserved by the `resolving` flag.
+  - **Overflow eviction no longer silently no-ops.** Entries already mid-resolution can't be force-resolved again, so `park()` now evicts the oldest *non-resolving* entry and logs when every entry is draining (bounded overshoot = arrival rate × retry window) instead of leaving the map to grow past `HL_FILL_PARK_MAX_SIZE` unchecked.
+  - New env knobs: `HL_FILL_REST_RETRIES`, `HL_FILL_REST_RETRY_DELAY_MS`. Test coverage grew 7 → 10 in `test/hyperliquidFillPark.test.ts`: the harness's event builders now identify which rung resolved each emit (fills = buffer, commonOrder = REST, neither = limitPx) so a rung can no longer pass by accident — the stale `grace → REST fallback` assertion had been unpassable since v1.12.1 for exactly that reason. Added transient-failure-then-success, fills-landing-mid-retry, and one-emit-under-racing-triggers.
+
+## [1.13.2] - 2026-07-25
+
+### Fixed
+
+- **Bybit price-connector crash-loop on harmless "already subscribed" WS replies — unbounded memory/CPU (bug #121).** Bybit answers a re-subscribe of a still-active topic with `{success:false, ret_msg:"error:already subscribed,topic:tickers.<SYM>"}`, and the vendored v5 client routes *any* `success:false` reply to the `exception` channel. `bybitRestartCb` treated every exception as fatal, so this informational message triggered a full `stopBybit()` + `initBybitWS()` + candle-stream reconnect. Compounding it, the restart path had **no re-entrancy guard** (unlike the `@IdMute`-wrapped candle helpers): the spot/linear/inverse clients each raise `exception` independently, so a burst started overlapping restart cycles — and since `initBybitWS` re-subscribes every ticker topic with 5s sleeps between markets, the overlap double-subscribed topics, producing more `already subscribed` and closing the feedback loop. WS clients/listeners were recreated faster than they were released (~1.3 GB RSS, ~270% CPU reported), until the watchdog saw no ticker data within 50s and — since `handleStall` only isolates `'candle'` stalls — escalated a `connect` stall to a full-worker crash every 40–90s. Fixes: `already subscribed` joins the existing benign-message skip list (`handler not found`, `format error`) and is logged at info rather than error; the restart cycle now runs under a `bybitRestarting` re-entrancy flag that **coalesces** concurrent exceptions into one cycle (deliberately a drop, not the serialising `IdMutex` — queueing would still run N full restarts for N exceptions) and clears in `finally` so later genuine failures still recover. `initBybitWS`'s failure path no longer recurses synchronously (which the guard would swallow) but retries via `setTimeout(wsReconnect)`. Genuinely fatal WS errors still trigger exactly one restart. Regression coverage in `test/bybitRestartStorm.test.ts`.
+
+## [1.13.1] - 2026-07-15
+
+### Fixed
+
+- **Kraken spot OHLC subscribe rejected — "Subscription ohlc interval must be an integer" (bug #77).** `connectKrakenCandleStream` passed the interval to the WS v2 `ohlc` subscribe as a *string* (`"240"`, `"1440"`, `"60"` — as it arrives from the candle room name), but Kraken only accepts a JSON number, so **every** Kraken spot candle WS subscription was rejected — on initial subscribe and again on every reconnect (the client replays the cached payload verbatim). Spot candles therefore never flowed over WS and consumers fell back to REST `getCandles` polling, contributing Kraken `EGeneral:Too many requests` pressure (alert #81). The interval is now coerced to a Kraken-supported integer (`1|5|15|30|60|240|1440|10080|21600`, with a named-interval fallback like `1h`→60), and unsupported values are skipped with a single warn instead of letting Kraken reject them on every replay. Futures (`candles_trade_*`) path unchanged.
+
+## [1.13.0] - 2026-07-06
+
+### Added
+
+- **Kraken tokenized-stock ("xStocks") price feed.** `getKrakenSymbolMaps()` (spot path) now also fetches `getAssetPairs({ aclass: 'tokenized_asset' })` and merges those pairs into the spot symbol maps, so xStock `wsname`s (e.g. `AAPLx/USD`) enter the subscription list consumed by `price/kraken.ts`. Their prices flow to Redis like any Kraken spot pair. Additive + flag-gated behind `KRAKEN_XSTOCKS_ENABLED` (default ON). Default AssetPairs returns zero tokenized pairs, so crypto pairs cannot regress.
+
+
+## [1.12.0] - 2026-07-06
+
+### Fixed
+
+- **Hyperliquid two-channel fill drop (root cause of the ongoing HL missed fills).** HL splits order data across two WS channels — `orderUpdates` (status only) and `userFills` (the real px/sz, buffered by cloid in `hyperliquidExpirableMap`). `prepareHyperliquidOrder` emitted execution reports from `orderUpdates` and **hard-dropped a FILLED update whose fills weren't buffered** (`if (isFilled && !get) return false`, added in v1.6.3). The drop was deliberate — emitting a FILLED without the buffered fills books it at `limitPx` instead of the real average price (an earlier bug Maksym fixed by dropping) — but any lost/late/expired/reconnect-snapshot `userFills` message then meant the FILLED event was never relayed to main-app, so the order stayed `NEW` and the deal silently froze. Replaced the drop with **park-and-retry** (`src/utils/hyperliquidFillPark.ts`), preserving price accuracy while closing the hole:
+  - A FILLED-without-fills update is PARKED in a bounded, TTL'd map (keyed by cloid; `HL_FILL_PARK_MAX_SIZE`, default 5000) instead of dropped.
+  - Resolution order (first that yields fills wins): **(1) buffer** — fills arriving on `userFills` during a grace window (`HL_FILL_PARK_GRACE_MS`, default 5s) resolve it immediately with the real average price, exactly as before; **(2) REST** — grace expires with no buffered fill ⇒ one `info.userFillsByTime` lookup (public, address-scoped) fetches the real fills; **(3) limitPx** — REST also fails/empty ⇒ emit at `limitPx` as a loudly-logged last resort (a slightly-off average beats a permanently frozen deal).
+  - `userFills` snapshots (replayed on reconnect) are no longer skipped wholesale: snapshot fills are now applied for cloids that have a parked order waiting on them (still gated so unrelated snapshot fills don't re-pollute the buffer — the original reason snapshots were skipped).
+  - Interim safety net unchanged: the fill-failsafe detector already reconciles these within ~35–60s; this patches the hole the net was covering. **Changes Maksym's deliberate price-accuracy tradeoff — requires his semantic review before deploy (ClickUp 86ey5zc49 §1).**
+  - New env knobs: `HL_FILL_PARK_GRACE_MS`, `HL_FILL_PARK_MAX_SIZE`, `HL_FILL_REST_LOOKBACK_MS`. Unit coverage under `test/` (`npm test`): fill-after-park (real price), grace→REST fallback, REST-fail/empty→limitPx, snapshot-fill matches parked update, and size-cap eviction.
+
+## [1.11.4] - 2026-07-05
+
+### Added
+- LOCAL-ONLY fault injector for the missed-fill failsafe repro harness: env-gated `DROP_USERSTREAM_FILLS=<clientOrderId|symbol>` (+`DROP_USERSTREAM_FILLS_COUNT`, default 1) suppresses matching FILLED-family paper `executionReport` relays in the paper `cbOrder` path; loud `[FAULT-INJECTOR]` logs; zero real-exchange impact (spec §9.1)
+
 ## [1.11.3] - 2026-07-05
 
 ### Fixed

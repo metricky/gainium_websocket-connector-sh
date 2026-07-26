@@ -19,6 +19,48 @@ const maxSubsPerClient = 200 // Conservative limit for Kraken
 
 const chunkSize = 100 // Symbols per subscription request
 
+// Kraken's candle OHLC feed is trade-driven (no periodic kline frames), so thin
+// markets legitimately go quiet well past the default candle timeout. Widen the
+// stall window for Kraken; the connection-liveness check (isFeedAlive) is the
+// real "is this feed dead" signal.
+const krakenCandleTradeTimeout = 180000
+
+// wsKey the kraken-api client uses per product family (matches the `subscribe`
+// calls below); also what `isConnected(wsKey)` is queried with.
+const spotWsKey = 'spotPublicV2'
+const derivativesWsKey = 'derivativesPublicV1'
+
+// Kraken spot OHLC (WS v2) only accepts these interval values, and only as a
+// JSON *number* — a numeric string ("240") is rejected with "Subscription ohlc
+// interval must be an integer", both on the initial subscribe and on every
+// auto-resubscribe after reconnect (the client replays the cached payload
+// verbatim). Intervals arrive here as strings from the candle room name.
+const KRAKEN_SPOT_OHLC_INTERVALS = new Set([
+  1, 5, 15, 30, 60, 240, 1440, 10080, 21600,
+])
+
+// Named-interval fallback ("1h") → Kraken minutes, in case a caller ever sends
+// the generic ExchangeIntervals form instead of minutes. Unsupported values
+// (2h, 8h, …) are deliberately absent — better to skip than spam rejections.
+const NAMED_TO_KRAKEN_MINUTES: Record<string, number> = {
+  '1m': 1,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '1h': 60,
+  '4h': 240,
+  '1d': 1440,
+  '1w': 10080,
+}
+
+/** Coerce an interval string to a Kraken-supported integer, or null. */
+const toKrakenSpotInterval = (interval: string): number | null => {
+  const n = /^\d+$/.test(interval)
+    ? Number(interval)
+    : NAMED_TO_KRAKEN_MINUTES[interval]
+  return n !== undefined && KRAKEN_SPOT_OHLC_INTERVALS.has(n) ? n : null
+}
+
 type KrakenClient = {
   client: KrakenWsClient
   subs: number
@@ -283,6 +325,16 @@ class KrakenConnector extends CommonConnector {
   }
 
   private connectKrakenCandleStream(symbol: string, interval: string) {
+    // Kraken rejects non-integer intervals; an invalid value would also be
+    // replayed (and re-rejected) on every reconnect, so drop it up front.
+    const krakenInterval = toKrakenSpotInterval(interval)
+    if (krakenInterval === null) {
+      logger.warn(
+        `Kraken spot candle: unsupported interval "${interval}" for ${symbol}, skipping OHLC subscribe`,
+      )
+      return
+    }
+
     if (!this.krakenCandleClient) {
       this.krakenCandleClient = this.getKrakenClient('candle', false)
       this.krakenCandleClient.on(
@@ -297,7 +349,12 @@ class KrakenConnector extends CommonConnector {
 
     // Subscribe to ohlc for the symbol (spot only)
     this.krakenCandleClient.subscribe(
-      [{ topic: 'ohlc', payload: { symbol: [wsnameSymbol], interval } }],
+      [
+        {
+          topic: 'ohlc',
+          payload: { symbol: [wsnameSymbol], interval: krakenInterval },
+        },
+      ],
       'spotPublicV2',
     )
   }
@@ -528,6 +585,102 @@ class KrakenConnector extends CommonConnector {
     logger.info(
       `Subscribed to ${symbols.length} Kraken USDM markets across ${this.krakenUsdmClients.length} connections`,
     )
+  }
+
+  /**
+   * Recreate just the candle WS client for the stalled product family and
+   * re-subscribe every tracked candle topic, without touching ticker sockets or
+   * crashing the whole worker. Used for targeted stall recovery.
+   */
+  private restartKrakenCandleStreams(exchange: ExchangeEnum) {
+    const isUsdm = [
+      ExchangeEnum.krakenUsdm,
+      ExchangeEnum.paperKrakenUsdm,
+    ].includes(exchange)
+
+    if (isUsdm) {
+      if (this.krakenUsdmCandleClient) {
+        this.krakenUsdmCandleClient.closeAll(true)
+        this.krakenUsdmCandleClient.removeAllListeners()
+        this.krakenUsdmCandleClient = null
+      }
+    } else if (this.krakenCandleClient) {
+      this.krakenCandleClient.closeAll(true)
+      this.krakenCandleClient.removeAllListeners()
+      this.krakenCandleClient = null
+    }
+
+    for (const [ex, symbols] of this.subscribedCandlesMap) {
+      if (
+        !isUsdm &&
+        [ExchangeEnum.kraken, ExchangeEnum.paperKraken].includes(ex)
+      ) {
+        for (const data of symbols) {
+          const [symbol, interval] = this.splitCandleRoomName(data)
+          this.connectKrakenCandleStream(symbol, interval)
+        }
+      } else if (
+        isUsdm &&
+        [ExchangeEnum.krakenUsdm, ExchangeEnum.paperKrakenUsdm].includes(ex)
+      ) {
+        for (const data of symbols) {
+          const [symbol, interval] = this.splitCandleRoomName(data)
+          this.connectKrakenFuturesCandleStream(
+            symbol,
+            interval,
+            ExchangeEnum.krakenUsdm,
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * Connection-liveness signal used to suppress false-positive stalls. Kraken's
+   * candle/ticker feeds only push on trades, so a quiet thin market looks
+   * stalled while the socket is alive. `isConnected(wsKey)` reflects the real
+   * socket state (kept alive by the client's heartbeat/pong, reconnected when
+   * dead), so a CONNECTED socket means "alive, just quiet", not a stall.
+   */
+  protected override isFeedAlive(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle',
+  ): boolean {
+    const isUsdm = exchange === ExchangeEnum.krakenUsdm
+    if (kind === 'candle') {
+      const client = isUsdm
+        ? this.krakenUsdmCandleClient
+        : this.krakenCandleClient
+      return !!client?.isConnected(isUsdm ? derivativesWsKey : spotWsKey)
+    }
+    const clients = isUsdm ? this.krakenUsdmClients : this.krakenSpotClients
+    const wsKey = isUsdm ? derivativesWsKey : spotWsKey
+    return clients.some((c) => c.client.isConnected(wsKey))
+  }
+
+  /**
+   * Recover a candle stall by restarting only the affected Kraken candle stream
+   * instead of crashing the whole worker (which drops every other exchange's
+   * candle streams too). Ticker/connect stalls fall through to the full-worker
+   * restart. `CommonConnector` bounds how many times this runs before escalating
+   * to the old throw-based restart.
+   */
+  protected override handleStall(
+    exchange: ExchangeEnum,
+    kind: 'price' | 'candle' | 'connect',
+  ): boolean {
+    if (kind !== 'candle') {
+      return false
+    }
+    logger.info(
+      `Kraken ${exchange} candle stall — targeted candle-stream restart (no full-worker crash)`,
+    )
+    this.restartKrakenCandleStreams(exchange)
+    return true
+  }
+
+  protected override getTradeTimeout(_exchange: ExchangeEnum): number {
+    return Math.max(this.tradeTimeout, krakenCandleTradeTimeout)
   }
 
   override stop() {

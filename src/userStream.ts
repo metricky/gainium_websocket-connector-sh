@@ -72,7 +72,10 @@ import logger from './utils/logger'
 import { IdMute, IdMutex } from './utils/mutex'
 import sleep from './utils/sleep'
 import {
+  BaseReturn,
   KucoinSymbol,
+  ReturnBad,
+  StatusEnum,
   getKrakenSymbolMaps,
   getKucoinSymbolsByMarket,
   resetKrakenMaps,
@@ -87,7 +90,7 @@ import {
 import RedisClient, { RedisWrapper } from './utils/redis'
 import { v4 } from 'uuid'
 import Rabbit from './utils/rabbit'
-import { rabbitUsersStreamKey, serviceLogRedis } from '../type'
+import { CommonOrder, rabbitUsersStreamKey, serviceLogRedis } from '../type'
 import { RestClientV5 } from 'bybit-api'
 import ExpirableMap from './utils/expirableMap'
 import HyperliquidBalancer, {
@@ -101,6 +104,13 @@ import {
   reserveHyperliquidIp,
 } from './utils/hyperliquidIpRotation'
 import { HyperliquidUserClient } from './utils/hyperliquidUserClient'
+import {
+  HyperliquidFillParkResolver,
+  ingestUserFills,
+  type ParkContext,
+} from './utils/hyperliquidFillPark'
+import { exchangeUrl } from './utils/env'
+import axios from 'axios'
 
 const mutex = new IdMutex()
 
@@ -561,6 +571,18 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   true,
 )
 
+// Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
+// Grace window: how long a FILLED orderUpdate waits for its `userFills` to
+// arrive before falling back to a REST lookup. Size cap bounds the map.
+const HL_FILL_PARK_GRACE_MS = Number(process.env.HL_FILL_PARK_GRACE_MS) || 5000
+const HL_FILL_PARK_MAX_SIZE = Number(process.env.HL_FILL_PARK_MAX_SIZE) || 5000
+// REST attempts (including the first) before a parked fill falls back to
+// limitPx, and the base backoff between them (doubles each attempt). Retrying
+// keeps a transient balancer blip from costing us the real fill price.
+const HL_FILL_REST_RETRIES = Number(process.env.HL_FILL_REST_RETRIES) || 3
+const HL_FILL_REST_RETRY_DELAY_MS =
+  Number(process.env.HL_FILL_REST_RETRY_DELAY_MS) || 1000
+
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
 class UserConnector {
@@ -634,6 +656,47 @@ class UserConnector {
   private lastEventAt: Map<string, number> = new Map()
   private lastResubAt: Map<string, number> = new Map()
   private livenessTimer: NodeJS.Timeout | null = null
+  /**
+   * HL two-channel fill join: park a FILLED orderUpdate whose `userFills`
+   * aren't buffered yet (instead of hard-dropping it and freezing the deal),
+   * and resolve it from the buffer → REST → limitPx. See hyperliquidFillPark.ts.
+   */
+  private hlFillParkResolver = new HyperliquidFillParkResolver<
+    hl.OrderStatus<hl.Order>,
+    hl.Fill,
+    UserDataStreamEvent & { uniqueMessageId?: string }
+  >({
+    graceMs: HL_FILL_PARK_GRACE_MS,
+    maxSize: HL_FILL_PARK_MAX_SIZE,
+    getBufferedFills: (cloid) => hyperliquidExpirableMap.get(cloid),
+    clearBufferedFills: (cloid) => {
+      hyperliquidExpirableMap.delete(cloid)
+    },
+    restLookup: (ctx) => this.hlRestLookupOrder(ctx),
+    restRetries: HL_FILL_REST_RETRIES,
+    restRetryDelayMs: HL_FILL_REST_RETRY_DELAY_MS,
+    buildEvent: (order, fills) =>
+      this.buildHyperliquidExecutionReport(order, fills),
+    buildEventFromCommonOrder: (order, commonOrder) =>
+      this.buildHyperliquidExecutionReportFromCommonOrder(order, commonOrder),
+    emit: (roomId, event) => this.userStreamEvent(roomId, event),
+    log: (msg, isError) => this.logger(msg, isError),
+  })
+  /**
+   * LOCAL-ONLY fault injector for the missed-fill failsafe repro harness
+   * (spec §9.1). When `DROP_USERSTREAM_FILLS` is set to a clientOrderId (matched
+   * against `msg.externalId`) OR a symbol (matched against `msg.symbol`), the
+   * next `DROP_USERSTREAM_FILLS_COUNT` (default 1) FILLED-family paper order
+   * events for that target are suppressed — simulating a user-stream drop so a
+   * fill sits `NEW` in main-app forever. Everything else (balances, other
+   * orders, non-fill statuses) passes through untouched. Default off; zero
+   * impact on real exchanges (paper `cbOrder` path only).
+   */
+  private dropFillsTarget = process.env.DROP_USERSTREAM_FILLS?.trim() || ''
+  private dropFillsRemaining =
+    this.dropFillsTarget !== ''
+      ? Math.max(1, +(process.env.DROP_USERSTREAM_FILLS_COUNT ?? '1') || 1)
+      : 0
   /** Constructor method
    * Determine class variables
    * Start server
@@ -676,6 +739,12 @@ class UserConnector {
         onAdminConfigChange(() => this.dropStreamsForDisabledExchanges())
       }
       this.startLivenessGuard()
+      if (this.dropFillsTarget !== '') {
+        this.logger(
+          `[FAULT-INJECTOR] ARMED — DROP_USERSTREAM_FILLS=${this.dropFillsTarget} ` +
+            `count=${this.dropFillsRemaining} (paper FILLED-family events only; LOCAL repro harness)`,
+        )
+      }
     }
   }
 
@@ -2540,17 +2609,32 @@ class UserConnector {
             onOrderUpdates: async (msgs) => {
               const prepared = await this.prepareHyperliquidOrder(
                 msgs as hl.OrderStatus<hl.Order>[],
+                {
+                  roomId: id,
+                  user: api.key,
+                  exchange: api.provider,
+                  key: api.key,
+                },
               )
               prepared.map((o) => this.userStreamEvent(id, o))
             },
             onUserFills: (data) => {
-              if (data.isSnapshot) return
-              for (const f of data.fills as hl.WsUserFills['fills']) {
-                if (!f.cloid) continue
-                const get = hyperliquidExpirableMap.get(f.cloid) ?? []
-                get.push(f)
-                hyperliquidExpirableMap.set(f.cloid, get)
-              }
+              // Buffer live fills (always) and reconnect-snapshot fills (only
+              // for cloids with a PARKED order waiting on them), then wake any
+              // parked order so it resolves with the real price immediately.
+              ingestUserFills(
+                data as { isSnapshot?: boolean; fills: hl.Fill[] },
+                {
+                  appendFill: (cloid, fill) => {
+                    const get = hyperliquidExpirableMap.get(cloid) ?? []
+                    get.push(fill)
+                    hyperliquidExpirableMap.set(cloid, get)
+                  },
+                  isParked: (cloid) => this.hlFillParkResolver.has(cloid),
+                  notifyFillArrived: (cloid) =>
+                    this.hlFillParkResolver.notifyFillArrived(cloid),
+                },
+              )
             },
             getReconnectDelay: (attempt) => {
               const base = Math.min(2 ** attempt * 1000, 60_000)
@@ -2761,6 +2845,23 @@ class UserConnector {
               return
             }
             if (msg) {
+              // LOCAL-ONLY missed-fill fault injector (spec §9.1). Suppress the
+              // relay of FILLED-family paper events matching the configured
+              // target so the fill is never booked in main-app (stuck NEW),
+              // reproducing the prod user-stream drop. Everything else flows.
+              if (
+                this.dropFillsRemaining > 0 &&
+                (msg.externalId === this.dropFillsTarget ||
+                  msg.symbol === this.dropFillsTarget) &&
+                (msg.status === 'FILLED' || msg.status === 'PARTIALLY_FILLED')
+              ) {
+                this.dropFillsRemaining -= 1
+                this.logger(
+                  `[FAULT-INJECTOR] dropping executionReport for ` +
+                    `${msg.externalId}/${msg.symbol} (${this.dropFillsRemaining} remaining)`,
+                )
+                return
+              }
               this.userStreamEvent(id, this.preparePaperOrderMsg(msg))
             }
           }
@@ -2902,7 +3003,7 @@ class UserConnector {
         }
         await sleep(250)
         for (let i = 0; i < count; i++) {
-          await this.openStreamCallback(msg, undefined)
+          await this.openStreamCallback(msg, uuid)
         }
         this.logger(
           `Restarted ${c}${uuid ? '' : ` of ${this.users.length} `}${user.id} ${msg.userId}`,
@@ -3286,79 +3387,175 @@ class UserConnector {
     }
   }
 
+  /**
+   * Build an execution-report event from an HL orderUpdates entry plus the
+   * fills to price it with. When `fills` is empty it prices at `limitPx` —
+   * exactly the legacy behaviour when no fills were buffered. Pure: no buffer
+   * mutation, so it's safe to call from the immediate path and the park
+   * resolver alike.
+   */
+  private buildHyperliquidExecutionReport(
+    order: hl.OrderStatus<hl.Order>,
+    fills: hl.Fill[],
+  ): UserDataStreamEvent & { uniqueMessageId?: string } {
+    const isFilled = order.status === 'filled'
+    let filledSize = +order.order.origSz - +order.order.sz
+    let quote = +order.order.limitPx * filledSize
+    let price = `${order.order.limitPx}`
+    const pricePrecision =
+      price.indexOf('.') >= 0 ? price.split('.')[1].length : 0
+    if (isNaN(quote) || !isFinite(quote)) {
+      quote = 0
+    }
+    const get = fills.length ? fills : undefined
+    if (get) {
+      if (filledSize > 0) {
+        filledSize = get.reduce((a, c) => a + +c.sz, 0)
+        quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
+        price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
+      }
+    }
+    if (
+      isFilled &&
+      (filledSize < +order.order.origSz || filledSize > +order.order.origSz)
+    ) {
+      filledSize = +order.order.origSz
+      quote = +price * filledSize
+    }
+
+    return {
+      creationTime: new Date(order.statusTimestamp).getTime(),
+      eventTime: new Date(order.statusTimestamp).getTime(),
+      eventType: 'executionReport',
+      newClientOrderId: order.order.cloid ?? '',
+      orderId: order.order.oid,
+      orderTime: new Date(order.statusTimestamp).getTime(),
+      orderStatus: isFilled
+        ? 'FILLED'
+        : order.status === 'open'
+          ? filledSize > 0
+            ? 'PARTIALLY_FILLED'
+            : 'NEW'
+          : 'CANCELED',
+      orderType: 'LIMIT',
+      originalClientOrderId: order.order.cloid ?? '',
+      price,
+      quantity: `${order.order.origSz}`,
+      side: order.order.side === 'A' ? 'BUY' : 'SELL',
+      symbol: order.order.coin,
+      totalQuoteTradeQuantity: `${quote}`,
+      totalTradeQuantity: `${filledSize}`,
+      uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(get || [])}`,
+      liquidation: false,
+    }
+  }
+
+  private buildHyperliquidExecutionReportFromCommonOrder(
+    order: hl.OrderStatus<hl.Order>,
+    commonOrder: CommonOrder,
+  ): UserDataStreamEvent & { uniqueMessageId?: string } {
+    return {
+      creationTime: new Date(order.statusTimestamp).getTime(),
+      eventTime: new Date(order.statusTimestamp).getTime(),
+      eventType: 'executionReport',
+      newClientOrderId: order.order.cloid ?? '',
+      orderId: order.order.oid,
+      orderTime: new Date(order.statusTimestamp).getTime(),
+      orderStatus: commonOrder.status,
+      orderType: 'LIMIT',
+      originalClientOrderId: order.order.cloid ?? '',
+      price: commonOrder.price,
+      quantity: `${order.order.origSz}`,
+      side: order.order.side === 'A' ? 'BUY' : 'SELL',
+      symbol: order.order.coin,
+      totalQuoteTradeQuantity: `${commonOrder.cummulativeQuoteQty}`,
+      totalTradeQuantity: `${commonOrder.executedQty}`,
+      uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(commonOrder)}`,
+      liquidation: false,
+    }
+  }
+
+  /**
+   * REST fallback for a parked HL fill: fetch the settled order (with its real
+   * executed price/qty) by cloid through the exchange balancer. Returns `null`
+   * when the order can't be looked up or isn't found — the resolver then retries
+   * with backoff and only emits at limitPx once every attempt is spent. Reached
+   * only on the rare dropped-fill path, never in steady state.
+   */
+  private async hlRestLookupOrder(
+    ctx: ParkContext,
+  ): Promise<CommonOrder | null> {
+    const url = exchangeUrl()
+    if (!url || !ctx.key || !ctx.exchange) {
+      logger.error(
+        `Cannot get order ${ctx.cloid} when not enough data. url=${url} key=${ctx.key} exchange=${ctx.exchange}`,
+      )
+      return null
+    }
+    const data = await axios
+      .get<BaseReturn<CommonOrder>>(
+        `${url}/order?newClientOrderId=${ctx.cloid}`,
+        {
+          headers: {
+            exchange: ctx.exchange,
+            key: ctx.key,
+            secret: '',
+          },
+        },
+      )
+      .then((r) => r.data)
+      .catch((e) => {
+        logger.error(`Cannot get order info for ${ctx.cloid} ${e}`)
+        return {
+          status: StatusEnum.notok,
+          reason: 'Cannot get orders info',
+          data: null,
+        } as ReturnBad
+      })
+    return data.data
+  }
+
+  /**
+   * Convert HL orderUpdates into execution-report events.
+   *
+   * A FILLED update whose `userFills` aren't buffered yet is NO LONGER dropped
+   * (dropping froze the deal). Instead it is PARKED (see hlFillParkResolver):
+   * the fills get a grace window to arrive, then a REST lookup, then limitPx as
+   * a last resort — preserving Maksym's price-accuracy fix while closing the
+   * hole. Everything else (NEW / PARTIALLY_FILLED / CANCELED, and FILLED with
+   * buffered fills) is emitted immediately, exactly as before.
+   */
   private async prepareHyperliquidOrder(
     data: hl.OrderStatus<hl.Order>[],
+    ctx: { roomId: string; user: string; exchange: ExchangeEnum; key: string },
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
-    return await Promise.all(
-      data
-        .filter((o) => {
-          if (!o.order.cloid) {
-            return
-          }
-          const isFilled = o.status === 'filled'
-          const get = hyperliquidExpirableMap.get(`${o.order.cloid}`)
-          if (isFilled && !get) {
-            return false
-          }
-          return true
+    const out: (UserDataStreamEvent & { uniqueMessageId?: string })[] = []
+    for (const order of data) {
+      if (!order.order.cloid) {
+        continue
+      }
+      const cloid = `${order.order.cloid}`
+      const isFilled = order.status === 'filled'
+      const buffered = hyperliquidExpirableMap.get(cloid)
+      if (isFilled && !(buffered && buffered.length)) {
+        this.hlFillParkResolver.park({
+          cloid,
+          roomId: ctx.roomId,
+          oid: order.order.oid,
+          user: ctx.user,
+          statusTimestamp: new Date(order.statusTimestamp).getTime(),
+          order,
+          exchange: ctx.exchange,
+          key: ctx.key,
         })
-        .map(async (order) => {
-          const isFilled = order.status === 'filled'
-          let filledSize = +order.order.origSz - +order.order.sz
-          let quote = +order.order.limitPx * filledSize
-          let price = `${order.order.limitPx}`
-          const pricePrecision =
-            price.indexOf('.') >= 0 ? price.split('.')[1].length : 0
-          if (isNaN(quote) || !isFinite(quote)) {
-            quote = 0
-          }
-          const get = hyperliquidExpirableMap.get(`${order.order.cloid}`)
-          if (get) {
-            if (filledSize > 0) {
-              filledSize = get.reduce((a, c) => a + +c.sz, 0)
-              quote = get.reduce((a, c) => a + +c.sz * +c.px, 0)
-              price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
-            }
-            if (isFilled) {
-              hyperliquidExpirableMap.delete(`${order.order.cloid}`)
-            }
-          }
-          if (
-            isFilled &&
-            (filledSize < +order.order.origSz ||
-              filledSize > +order.order.origSz)
-          ) {
-            filledSize = +order.order.origSz
-            quote = +price * filledSize
-          }
-
-          return {
-            creationTime: new Date(order.statusTimestamp).getTime(),
-            eventTime: new Date(order.statusTimestamp).getTime(),
-            eventType: 'executionReport',
-            newClientOrderId: order.order.cloid ?? '',
-            orderId: order.order.oid,
-            orderTime: new Date(order.statusTimestamp).getTime(),
-            orderStatus: isFilled
-              ? 'FILLED'
-              : order.status === 'open'
-                ? filledSize > 0
-                  ? 'PARTIALLY_FILLED'
-                  : 'NEW'
-                : 'CANCELED',
-            orderType: 'LIMIT',
-            originalClientOrderId: order.order.cloid ?? '',
-            price,
-            quantity: `${order.order.origSz}`,
-            side: order.order.side === 'A' ? 'BUY' : 'SELL',
-            symbol: order.order.coin,
-            totalQuoteTradeQuantity: `${quote}`,
-            totalTradeQuantity: `${filledSize}`,
-            uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(get || [])}`,
-            liquidation: false,
-          }
-        }),
-    )
+        continue
+      }
+      out.push(this.buildHyperliquidExecutionReport(order, buffered ?? []))
+      if (isFilled && buffered && buffered.length) {
+        hyperliquidExpirableMap.delete(cloid)
+      }
+    }
+    return out
   }
 
   private prepareOkxOutboundAccountInfo(
