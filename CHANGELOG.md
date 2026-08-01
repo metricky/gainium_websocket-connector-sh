@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed Hyperliquid ticker subscription spun a zero-delay restart loop that starved the entire price worker's event loop (bug #218).** `initHyperliquidWS()`'s `catch` called `hyperliquidRestartCb()` directly, which calls `initHyperliquidWS()` again — no delay, no backoff, no in-flight guard. While Hyperliquid rate-limits our IP the `allMids` subscribe fails persistently, so the two functions called each other in a tight loop; and because each iteration tears down and rebuilds every `WebSocketTransport`, the loop kept re-tripping the per-IP connection limit that caused it. Field data from a 25h run: 244k `allMids subscription failed` lines (peak 2 304/s, ~90% of all price-connector error output, three 55MB rotated logs inside 4-minute windows), 297k abnormal socket closes, 231% CPU / 1.3GB RSS. Critically the loop re-enters through *already-settled* promises, so every iteration is a microtask and the macrotask queue never gets a turn: a driven A/B measured **578 149 subscribe attempts and 1 156 296 transports in 100s, with a 1s `setInterval` firing 0 times** — i.e. `CommonConnector.watchdogFn` and every other exchange's timers were stopped too, which is the real source of the collateral `bitgetUsdm` stall crashes seen in the same runs. All full restarts now go through a single-flight `scheduleHyperliquidRestart()`: concurrent requests coalesce into the pending restart, and the delay is `backoff − elapsed` (30s, doubling to a 5min cap, reset to base after 10min quiet) so a restart following a healthy period still fires **immediately** and only consecutive failures are paced. Same A/B after the fix: **4 attempts / 6 transports in 100s, 99 of 100 timer ticks**.
+- **A Hyperliquid stall crashed the whole price worker, taking every other exchange's feeds with it.** 1.14.0 added the `handleStall` isolation hook so a stalled exchange restarts only its own streams; Kraken and Bybit adopted it but `HyperliquidConnector` did not, so a stall still reached the `throw` in `CommonConnector.watchdogFn` — and a throw inside a `setInterval` callback is an uncaught exception that terminates the process. `HyperliquidConnector` now overrides `handleStall` for all three stall kinds (a full Hyperliquid restart rebuilds ticker and candle clients alike), routed through the same paced scheduler. `CommonConnector` still escalates to the full-worker restart after `maxTargetedRestarts`, so a genuinely dead worker is still replaced — verified: the first two stalls are handled in place, the third still throws.
+- The per-IP connection ceiling is now the named `maxHyperliquidConnections` constant, overridable via `HYPERLIQUID_MAX_WS_CONNECTIONS`, and the stale "≤10 connections" comment in `getCandleClient` is corrected. The default is unchanged — Hyperliquid documents 10 simultaneous WS connections per IP, so the derived candle-client cap stays at 8. `stop()` now also clears the restart timer.
+
+## [1.14.0] - 2026-07-30
+
+### Added
+
+- OKX Europe X-Perp ticker feed: a dedicated, isolated WS client subscribed only to xperp instruments publishes them on the canonical `trade@{pair}@okxLinear` channels (expiry suffix stripped to the `BTC-USD_UM_XPERP` pair id). Optional `OKX_EU_ONLY` mode for EU-only deployments. Contributed by community member discord2020 (forum topic 4925).
+- X-Perp candle streams: candle subscriptions resolve the instFamily to the live expiry-suffixed instId (the WS channel rejects the bare family id).
+
+## [1.13.7] - 2026-07-30
+
+### Fixed
+
+- **Price connector's restart announcement never left the process — every restart silently orphaned every candle subscription platform-wide.** `init()` published `{restart:'priceConnector'}` on `serviceLog` with a bare `this.redis?.publish(...)`, but `initRedis()` is fire-and-forget from the constructor and `index.price` calls `init()` synchronously after `new Connector()`, so `this.redis` was *always* still null and `RedisWrapper.publish` returned early without sending. Since candle subscriptions live only in this process's memory, consumers were never told to re-request them: after the nightly 02:00 exit the connector held ~0 candle subscriptions while ~13.5k Redis candle channels still had subscribers. Measured on prod 2026-07-30, 3.5h after the restart: candle publishes came from `bitget` only; `binance` (6.7k subscribed channels), `bybit`, `okx`, `kraken`, `kucoin` and `hyperliquid` were all silent, while `trade@` tickers were healthy. Bug #162's Hyperliquid candle-blindness was one symptom of this. `announceBoot()` now awaits the Redis client before publishing.
+- **Restart recovery no longer depends on a single un-acknowledged pub/sub message.** The connector also publishes a repeating `{priceConnectorAlive:{bootId,role}}` beacon on `serviceLog` every 60s, carrying a per-instance boot id (also added to the one-shot broadcast so consumers can dedupe the two). Consumers on main-app-sh ≥1.37.11 re-request their candle subscriptions when the id changes, so a broadcast lost to a flapping subscription self-heals within a beacon interval instead of persisting until the consumer's own next restart. Deliberately omits `.restart` so pre-beacon consumers ignore it rather than re-requesting every 60s. `stop()` clears the timer so an in-process rebuild doesn't stack beacons.
+
+## [1.13.6] - 2026-07-29
+
+### Added
+
+- **Kraken auth-rejection circuit-breaker now tells the user, not just the log.** When the breaker (v1.13.5) trips it additionally publishes a `userStreamAuthReject` event `{exchange, userId, reason}` on the existing `serviceLog` Redis channel — the same channel main-app already consumes for `userStreamFlap` — where main-app ≥2.71.20 turns it into a per-user bot-message warning naming the missing "WebSocket interface" permission (or the revoked-key case). Emit-only: a publish failure never affects the breaker. Older main-app versions ignore the unknown event.
+
+## [1.13.5] - 2026-07-29
+
+### Fixed
+
+- **Kraken auth-feed subscribe failures retried forever, silently degrading fill delivery (issue #167 / ClickUp 86eyep5au).** Two shapes, both deterministic key problems the retry loop can never fix: `EGeneral:Permission denied` — the WS-token REST call rejected because the API key lacks Kraken's "WebSocket interface" permission (16 users on 07-28; REST verify passes, so the connection looks healthy and nothing upstream ever stops re-requesting the stream) — and `Failed to subscribe to authenticated feed` on Kraken Futures (revoked/disabled keys on status=false connections, where the client library reconnects forever). Affected users got no realtime order updates and fell back to reconcile-sweep-only fills, with no error surfaced anywhere (12 users / 25 open Kraken DCA bots measured). The `exception` handler — which previously only logged — now feeds the existing auth-rejection circuit-breaker: on first sight of either error it closes the client (stopping the library's internal retry loop), arms the shared `authCooldownUntil` cooldown (`USER_STREAM_AUTH_COOLDOWN_MS`, default 30min) that already gates `openStreamCallback` re-requests, and schedules the same single delayed retry the Binance breaker uses, so a key fixed in place (permission enabled on the same key) self-heals without a bot restart. First-sight rather than hits-in-window because Kraken's retry cadence (20min–6h per account, measured on prod) never trips a windowed threshold, and a futures subscribe rejects its 3 topics in one burst — the cooldown check collapses the burst to one arming. Flap-alert suppression and the auto-clear on a genuine `executionReport` come free from reusing the shared maps.
+
+### Fixed
+
+- **Hyperliquid socket errors always logged as `Hyperliquid error: {}`.** `JSON.stringify` on a WebSocket `ErrorEvent` only serializes enumerable fields — an `ErrorEvent` has none — so every socket failure was logged with its cause erased. The handler now reads `message`/`error.message`/`type` explicitly.
+- **Skipped Hyperliquid candle subscriptions now say *why* translation failed.** The dominant prod case (1,746 log lines since Jun 15) is a producer sending an already-translated wire code (`BTC`, `xyz:GOLD`) where a display pair (`BTC-USDC`) is expected: the subscription is dropped and, since candles publish on display-pair channels, that consumer receives no data. The error now names the resolved display pair so the mismatch is visible in one log line instead of needing a cross-service trace. Root cause fixed on the producer side in main-app core 1.37.8; the diagnostic stays for older/self-hosted producers.
+
 ## [1.13.3] - 2026-07-25
 
 ### Fixed
