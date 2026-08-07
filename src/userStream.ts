@@ -82,6 +82,10 @@ import {
 } from './utils/exchange'
 import { convertSymbol, convertSymbolToKucoin } from './utils/kucoin'
 import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from './utils/common'
+// Exchange SDKs staple the signed request / outbound auth frame onto what they
+// hand us on an error path. Everything derived from an SDK error or an SDK
+// logger callback goes through `safeStringify`, never `JSON.stringify`.
+import { safeStringify } from './utils/redact'
 import {
   isAdminConfigEnabled,
   isExchangeEnabled,
@@ -571,6 +575,15 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
   true,
 )
 
+// Running per-order fill totals for Kraken futures, keyed by exchange order id.
+// The `fills` feed is incremental; the ExecutionReport contract is cumulative.
+// See prepareKrakenOrderMsg. Entries expire on their own so an order whose last
+// fill we never see cannot leak.
+const krakenFillTotals = new ExpirableMap<
+  string,
+  { qty: number; cost: number; fillIds: Set<string> }
+>(60 * 60 * 1000)
+
 // Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
 // Grace window: how long a FILLED orderUpdate waits for its `userFills` to
 // arrive before falling back to a REST lookup. Size cap bounds the map.
@@ -623,6 +636,30 @@ class UserConnector {
    *  allowed. While in cooldown we neither reopen the stream nor emit a flap
    *  alert for the room (it's a user credential problem, not dead infra). */
   private authCooldownUntil: Map<string, number> = new Map()
+  /** Log latch for the cooldown skip: room id → how many subscribe attempts
+   *  have been skipped silently since we logged the skip for this cooldown
+   *  period. Presence means "already logged". Callers (main-app's stream
+   *  watchdog, fill-failsafe escalation, per-bot subscribe) re-request a
+   *  circuit-broken room several times a minute with no backoff, so logging
+   *  the skip per attempt drowned every other line in the service log. */
+  private authCooldownSkipsSuppressed: Map<string, number> = new Map()
+  /** Consecutive auth-rejection cycles per room id, driving the exponential
+   *  self-heal backoff (see `authCooldownMs`). A flat 30min retry means a
+   *  permanently-revoked key logs a rejection + a circuit-broken line 48x a
+   *  day, forever — across ~20 accounts that was the single largest source of
+   *  error lines in the service log (bug #289). Reset when the key proves
+   *  itself (a genuine account event) or when the room ran clean long enough
+   *  that the last rejection is no longer consecutive. */
+  private authCooldownStrikes: Map<string, number> = new Map()
+  /** Epoch-ms of the last auth rejection per room id. Only used to decide
+   *  whether a new rejection continues the current strike run or starts a
+   *  fresh one. */
+  private authLastRejectAt: Map<string, number> = new Map()
+  /** Pending self-heal retry timer per room id. Tracked so a room that is
+   *  torn down while circuit-broken (the user deleted the connection) can
+   *  have its retry cancelled — otherwise the timer resurrects a stream for a
+   *  credential that no longer exists, forever. */
+  private authRetryTimers: Map<string, NodeJS.Timeout> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -1085,6 +1122,188 @@ class UserConnector {
     return logger.info(msg)
   }
 
+  /**
+   * Drop the once-per-cooldown log latch for a room, reporting how many
+   * subscribe attempts were skipped silently while it was armed. Safe to call
+   * for a room that was never in cooldown — it no-ops.
+   */
+  private releaseAuthCooldownLogLatch(id: string, userId?: string) {
+    const suppressed = this.authCooldownSkipsSuppressed.get(id)
+    if (suppressed === undefined) {
+      return
+    }
+    this.authCooldownSkipsSuppressed.delete(id)
+    if (suppressed > 0) {
+      this.logger(
+        `Auth-rejection cooldown ended for ${userId ?? id} (room ${id}) — ${suppressed} further subscribe attempt(s) were skipped without logging`,
+      )
+    }
+  }
+
+  /**
+   * Cooldown length for the Nth consecutive auth rejection of a room: the base
+   * (30min) doubled per prior strike, capped at 24h — 30min, 1h, 2h, 4h, 8h,
+   * 16h, 24h, 24h…
+   *
+   * The retry exists so a key fixed in place self-heals; nothing about a
+   * revoked key gets better by asking every 30min. Escalating collapses a
+   * permanently-dead key from 48 rejection cycles a day to 1 without ever
+   * giving up on it, and a key that is genuinely fixed still recovers on the
+   * next retry (and callers re-requesting the room recover it sooner — the
+   * cooldown gate in `openStreamCallback` lets them through the moment it
+   * lapses, independent of this timer).
+   */
+  private authCooldownMs(strikes: number) {
+    const base = Math.max(
+      60_000,
+      Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) || 30 * 60 * 1000,
+    )
+    const cap = Math.max(
+      base,
+      Number(process.env.USER_STREAM_AUTH_COOLDOWN_MAX_MS) ||
+        24 * 60 * 60 * 1000,
+    )
+    // Clamp the exponent before shifting: strikes is unbounded over a process
+    // lifetime and 2 ** 1024 is Infinity.
+    return Math.min(base * 2 ** Math.min(strikes, 20), cap)
+  }
+
+  /**
+   * Classify a Kraken `exception` payload as a deterministically-fatal
+   * credential rejection. Three shapes, none of which heals by retrying:
+   *  - "EGeneral:Permission denied" — the WS-token REST call was rejected
+   *    because the key lacks the "WebSocket interface" permission. REST verify
+   *    passes, so upstream keeps the connection marked healthy and re-requests
+   *    this stream forever.
+   *  - "Failed to subscribe to authenticated feed" — Kraken Futures rejecting
+   *    the private feed auth (revoked/disabled key); the client library
+   *    reconnects forever.
+   *  - "EAPI:Invalid key" — Kraken spot rejecting the key itself on the
+   *    GetWebSocketsToken REST call (key deleted or revoked at the exchange).
+   *    Same class as the two above, but it was not matched, so two accounts
+   *    re-subscribed for 4+ days straight with no backoff and no user notice
+   *    (bug #340).
+   *
+   * Deliberately does NOT match the sibling "EAPI:Invalid nonce" — that is a
+   * transient clock/ordering fault which does heal on retry, and it occurs in
+   * prod alongside the invalid-key lines; breaking the circuit on it would
+   * park a healthy account for 30min-24h.
+   */
+  private isKrakenAuthReject(errorMsg: string) {
+    return (
+      /EGeneral\s*:?\s*Permission denied/i.test(errorMsg) ||
+      /Failed to subscribe to authenticated feed/i.test(errorMsg) ||
+      /EAPI\s*:?\s*Invalid key/i.test(errorMsg)
+    )
+  }
+
+  /**
+   * Arm (or re-arm) the auth-rejection circuit-breaker for a room and return
+   * the cooldown it earned. Shared by the Binance and Kraken breakers so both
+   * escalate identically.
+   *
+   * A rejection continues the current strike run only if it lands within twice
+   * the cooldown the previous strike earned — i.e. the retry came back
+   * rejected. A room that streamed fine for longer than that and only now
+   * rejects (key revoked later) starts the ladder over at the base cooldown.
+   */
+  private armAuthCooldown(id: string, userId?: string, now = Date.now()) {
+    const prevStrikes = this.authCooldownStrikes.get(id) ?? 0
+    const lastReject = this.authLastRejectAt.get(id) ?? 0
+    const consecutive =
+      prevStrikes > 0 &&
+      now - lastReject <= this.authCooldownMs(prevStrikes - 1) * 2
+    const strikes = consecutive ? prevStrikes : 0
+    const cooldownMs = this.authCooldownMs(strikes)
+    this.authCooldownStrikes.set(id, strikes + 1)
+    this.authLastRejectAt.set(id, now)
+    this.authCooldownUntil.set(id, now + cooldownMs)
+    // New cooldown period ⇒ new skip log allowed.
+    this.releaseAuthCooldownLogLatch(id, userId)
+    return { cooldownMs, strikes: strikes + 1 }
+  }
+
+  /**
+   * Schedule the single post-cooldown self-heal retry for a circuit-broken
+   * room, replacing any retry already pending for it. Tracked in
+   * `authRetryTimers` so `closeStreamCallback` can cancel it.
+   */
+  private scheduleAuthSelfHeal(
+    id: string,
+    subs: number | undefined,
+    msg: OpenStreamInput,
+    uuid: string | undefined,
+    cooldownMs: number,
+  ) {
+    if (!subs) {
+      return
+    }
+    this.clearAuthRetryTimer(id)
+    const timer = setTimeout(() => {
+      this.authRetryTimers.delete(id)
+      if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+        this.authCooldownUntil.delete(id)
+        ;[...Array(subs)].forEach(() => this.openStreamCallback(msg, uuid))
+      }
+    }, cooldownMs)
+    this.authRetryTimers.set(id, timer)
+  }
+
+  /**
+   * Tell main-app (which already consumes serviceLog for userStreamFlap) that
+   * this account's realtime feed was circuit-broken on a credential problem,
+   * so it can raise the one-per-day "Realtime feed unavailable" bot-message —
+   * otherwise the degradation stays invisible to the user. Emit-only: a
+   * publish failure must never affect the breaker.
+   */
+  private publishAuthRejectNotice(
+    exchange: ExchangeEnum,
+    userId: string | undefined,
+    reason: string,
+  ) {
+    try {
+      this.redis?.publish(
+        serviceLogRedis,
+        JSON.stringify({
+          userStreamAuthReject: { exchange, userId, reason },
+        }),
+      )
+    } catch {
+      /* emit-only */
+    }
+  }
+
+  /** Cancel a pending self-heal retry for a room. No-ops if none is armed. */
+  private clearAuthRetryTimer(id: string) {
+    const timer = this.authRetryTimers.get(id)
+    if (timer) {
+      clearTimeout(timer)
+      this.authRetryTimers.delete(id)
+    }
+  }
+
+  /**
+   * Drop the per-room bookkeeping for a room that no longer has any
+   * subscriber, so a removed connection can't be resurrected by a timer and
+   * the maps don't grow with dead credential hashes.
+   *
+   * `authCooldownUntil` is deliberately KEPT: the room may be torn down while
+   * still circuit-broken, and callers re-request a stream several times a
+   * minute — clearing the gate here would reopen the rejected stream on the
+   * next request and undo the breaker. It is dropped in `openStreamCallback`
+   * once it actually lapses.
+   */
+  private forgetSubscription(id: string) {
+    this.clearAuthRetryTimer(id)
+    this.subscribeMsgsMap.delete(id)
+    if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
+      this.authCooldownUntil.delete(id)
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
+      this.authCooldownSkipsSuppressed.delete(id)
+    }
+  }
+
   get OKXEnv() {
     return process.env.ENVOKX === 'sandbox' ? 'demo' : 'prod'
   }
@@ -1295,13 +1514,29 @@ class UserConnector {
     // rejected credential and never blocks a fixed key.
     const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
     if (cooldownUntil > Date.now()) {
-      return this.logger(
-        `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
-          (cooldownUntil - Date.now()) / 1000,
-        )}s`,
-        true,
-      )
+      // Log once per cooldown period, at info: the skip is the breaker working
+      // as designed, not a service error, and the callers re-ask ~5x/min.
+      const suppressed = this.authCooldownSkipsSuppressed.get(id)
+      if (suppressed === undefined) {
+        this.authCooldownSkipsSuppressed.set(id, 0)
+        return this.logger(
+          `Skip subscribe for ${userId} (${api.provider}): key in auth-rejection cooldown for ${Math.round(
+            (cooldownUntil - Date.now()) / 1000,
+          )}s — further skips for this room logged once when the cooldown ends`,
+        )
+      }
+      this.authCooldownSkipsSuppressed.set(id, suppressed + 1)
+      return
     }
+    // Cooldown lapsed (or was never armed): drop the latch so the next cooldown
+    // logs again, and report what the latch swallowed. Also drop the lapsed
+    // gate entry itself — the self-heal timer used to be the only thing that
+    // cleared it, and it no longer runs for every cooldown (a torn-down room
+    // has its retry cancelled).
+    if (cooldownUntil) {
+      this.authCooldownUntil.delete(id)
+    }
+    this.releaseAuthCooldownLogLatch(id, userId)
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1473,7 +1708,7 @@ class UserConnector {
         client.on('exception', async (data) => {
           let errorMsg = ''
           try {
-            errorMsg = JSON.stringify(data)
+            errorMsg = safeStringify(data)
           } catch {
             errorMsg = `error stringifying errorMsg ${data}`
           }
@@ -1490,7 +1725,26 @@ class UserConnector {
           // errors, stop and back off instead of resubscribing.
           const wsErr: any = data ?? {}
           const authCode = Number(wsErr?.error?.code ?? wsErr?.code)
+          const authMsg = String(wsErr?.error?.msg ?? wsErr?.msg ?? '')
+          // Deterministic-fatal WS-API flavour: on a `mainWSAPI` connection
+          // `subscribeUserDataStream()` sends an UNSIGNED
+          // `userDataStream.subscribe` and relies on `session.logon` having
+          // authenticated the session. When the key cannot log the session on
+          // (revoked, IP de-whitelisted, or not the Ed25519 key the WS-API
+          // path assumes) EVERY request comes back with this error and a
+          // reconnect changes nothing. It arrives with a non-401 status and an
+          // undocumented error code, so it never matched the numeric list
+          // below and fell through to the generic `binanceErrors >= 2`
+          // restart — stop/sleep(5s)/reopen, forever, with no backoff and no
+          // give-up (bug #294: one room produced ~94% of this service's error
+          // log). Match on the message and, like the Kraken branch further
+          // down, break the circuit on FIRST sight instead of waiting for a
+          // hits-in-window threshold.
+          const isFatalAuthReject = /WebSocket session not authenticated/i.test(
+            authMsg,
+          )
           const isAuthReject =
+            isFatalAuthReject ||
             [-2015, -2014, -2008].includes(authCode) ||
             Number(wsErr?.status) === 401
           if (isAuthReject) {
@@ -1501,20 +1755,27 @@ class UserConnector {
             const threshold =
               Number(process.env.USER_STREAM_AUTH_FAIL_THRESHOLD) || 3
             const now = Date.now()
+            // A single failed subscribe can emit this more than once before
+            // the teardown below lands; only the first arms the breaker.
+            if (
+              isFatalAuthReject &&
+              (this.authCooldownUntil.get(id) ?? 0) > now
+            ) {
+              return
+            }
             const hits = (this.binanceAuthErrors.get(id) ?? []).filter(
               (t) => now - t < windowMs,
             )
             hits.push(now)
-            if (hits.length < threshold) {
+            if (!isFatalAuthReject && hits.length < threshold) {
               this.binanceAuthErrors.set(id, hits)
               return
             }
-            const cooldownMs = Math.max(
-              60_000,
-              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
-                30 * 60 * 1000,
+            const { cooldownMs, strikes } = this.armAuthCooldown(
+              id,
+              userId,
+              now,
             )
-            this.authCooldownUntil.set(id, now + cooldownMs)
             this.binanceAuthErrors.delete(id)
             this.binanceErrors.delete(id)
             await stopMethod()
@@ -1522,27 +1783,24 @@ class UserConnector {
             const subs = this.subscribersMap.get(id)
             this.subscribersMap.delete(id)
             this.logger(
-              `${id} ${userId} Binance key rejected (code ${
-                authCode || 401
+              `${id} ${userId} Binance key rejected (${
+                isFatalAuthReject ? authMsg : `code ${authCode || 401}`
               }); circuit-broken for ${Math.round(
                 cooldownMs / 1000,
-              )}s — no reconnect, no flap alert`,
+              )}s (strike ${strikes}) — no reconnect, no flap alert`,
               true,
+            )
+            // Same user-facing notice the Kraken breaker already emits.
+            this.publishAuthRejectNotice(
+              api.provider,
+              userId,
+              isFatalAuthReject ? authMsg : `code ${authCode || 401}`,
             )
             // One delayed retry after the cooldown so a key fixed in place
             // (e.g. egress IP added to the whitelist without regenerating the
             // key) self-heals without a bot restart. If it's still rejected,
-            // this handler simply re-arms the cooldown.
-            if (subs) {
-              setTimeout(() => {
-                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
-                  this.authCooldownUntil.delete(id)
-                  ;[...Array(subs)].forEach(() =>
-                    this.openStreamCallback(msg, uuid),
-                  )
-                }
-              }, cooldownMs)
-            }
+            // this handler simply re-arms the cooldown, one step longer.
+            this.scheduleAuthSelfHeal(id, subs, msg, uuid, cooldownMs)
             return
           }
           this.binanceErrors.set(id, (this.binanceErrors.get(id) ?? 0) + 1)
@@ -1597,7 +1855,7 @@ class UserConnector {
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
-            `${id} ${userId} ${(err as Error).message || JSON.stringify(err)} ${api.provider}`,
+            `${id} ${userId} ${(err as Error).message || safeStringify(err)} ${api.provider}`,
             true,
           )
         }
@@ -1889,8 +2147,16 @@ class UserConnector {
                 r.retMsg === 'Your api key has expired.' ||
                 r.retMsg.includes('Error sign')
               ) {
+                // The account is identified by `id`/`userId`; the key and
+                // secret were interpolated here verbatim and this message is
+                // logged, which put a live bybit credential pair in the pm2
+                // error log every time a key was rejected. `safeStringify`
+                // cannot help — nothing is serialized, the secret is spliced
+                // straight into the string. The `Request not authorized`
+                // prefix is load-bearing: the `.catch` below and the WS
+                // exception handler both match on it.
                 throw new Error(
-                  `Request not authorized ${api.key} ${api.secret} ${api.provider} ${baseUrl} ${wsUrl}`,
+                  `Request not authorized ${id} ${userId} ${api.provider} ${baseUrl} ${wsUrl}`,
                 )
               }
               return account
@@ -1941,7 +2207,7 @@ class UserConnector {
             const message = typeof error !== 'string' ? error.message : error
             let m = `${message}`
             try {
-              m = message ?? JSON.stringify(error)
+              m = message ?? safeStringify(error)
               this.logger(
                 `${id} ${userId} bybit error ${m} ${api.provider} ${api.bybitHost} ${wsUrl}`,
                 true,
@@ -2138,7 +2404,7 @@ class UserConnector {
               try {
                 this.logger(
                   `${id} ${userId} okx error ${
-                    message ?? JSON.stringify(error)
+                    message ?? safeStringify(error)
                   } ${api.provider}`,
                   true,
                 )
@@ -2357,15 +2623,20 @@ class UserConnector {
             },
             {
               silly: () => null,
+              // Unlike the `msg?.[0]` adapters below, these two serialize every
+              // argument — including the `{ wsMessage, wsKey, exception }`
+              // context the SDK passes on a send failure. Bitget does not call
+              // these levels today, but the shape is the one that leaks, so
+              // redact rather than rely on that staying true across a bump.
               debug: (...msg) =>
                 this.logger(
-                  `${id} ${userId} bitget debug log ${JSON.stringify({
+                  `${id} ${userId} bitget debug log ${safeStringify({
                     msg,
                   })} ${api.provider}`,
                 ),
               notice: (...msg) =>
                 this.logger(
-                  `${id} ${userId} bitget notice log ${JSON.stringify({
+                  `${id} ${userId} bitget notice log ${safeStringify({
                     msg,
                   })} ${api.provider}`,
                 ),
@@ -2455,7 +2726,7 @@ class UserConnector {
             try {
               this.logger(
                 `${id} ${userId} bitget error ${
-                  message ?? JSON.stringify(error)
+                  message ?? safeStringify(error)
                 } ${api.provider}`,
                 true,
               )
@@ -2693,13 +2964,22 @@ class UserConnector {
             },
             {
               trace: () => null,
+              // These two are the only SDK logger adapters in this file that
+              // serialize *every* argument the library passes, and the Kraken
+              // client is the one that reaches them with credentials: its
+              // `tryWsSend()` catch logs `{ wsMessage, wsKey, exception }`
+              // where `wsMessage` is the serialized private frame (WS auth
+              // token), and its connect/`parseWsError` paths log the
+              // `parseException` object, which carries the signed REST headers.
+              // `safeStringify` strips both, including inside the serialized
+              // frame; see `utils/redact.ts`.
               info: (...args) =>
                 this.logger(
-                  `${id} Kraken info: ${JSON.stringify(args)} ${api.provider}`,
+                  `${id} Kraken info: ${safeStringify(args)} ${api.provider}`,
                 ),
               error: (...args) =>
                 this.logger(
-                  `${id} Kraken error: ${JSON.stringify(args)} ${api.provider}`,
+                  `${id} Kraken error: ${safeStringify(args)} ${api.provider}`,
                   true,
                 ),
             },
@@ -2804,27 +3084,17 @@ class UserConnector {
                 ? error
                 : error?.message ||
                   error?.body?.error?.join?.(',') ||
-                  JSON.stringify(error)
+                  safeStringify(error)
             this.logger(
               `${id} ${userId} Kraken exception ${errorMsg} ${api.provider}`,
               true,
             )
             // Auth-rejection circuit-breaker (Kraken flavour of the Binance
-            // one above). Two deterministic-fatal shapes:
-            //  - "EGeneral:Permission denied" — the WS-token REST call was
-            //    rejected because the key lacks the "WebSocket interface"
-            //    permission. REST verify passes, so upstream keeps the
-            //    connection marked healthy and re-requests this stream
-            //    forever.
-            //  - "Failed to subscribe to authenticated feed" — Kraken
-            //    Futures rejecting the private feed auth (revoked/disabled
-            //    key); the client library reconnects forever.
-            // Neither heals by retrying, and unlike Binance the retries are
-            // spread out over 20min-6h per account, so a hits-in-window
+            // one above). See `isKrakenAuthReject` for the shapes and why the
+            // transient nonce error is excluded. Unlike Binance the retries
+            // are spread out over 20min-6h per account, so a hits-in-window
             // threshold would never trip — break the circuit on first sight.
-            const isAuthReject =
-              /EGeneral\s*:?\s*Permission denied/i.test(errorMsg) ||
-              /Failed to subscribe to authenticated feed/i.test(errorMsg)
+            const isAuthReject = this.isKrakenAuthReject(errorMsg)
             if (!isAuthReject) {
               return
             }
@@ -2833,13 +3103,7 @@ class UserConnector {
             if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
               return
             }
-            const cooldownMs = Math.max(
-              60_000,
-              Number(process.env.USER_STREAM_AUTH_COOLDOWN_MS) ||
-                30 * 60 * 1000,
-            )
-            const now = Date.now()
-            this.authCooldownUntil.set(id, now + cooldownMs)
+            const { cooldownMs, strikes } = this.armAuthCooldown(id, userId)
             try {
               close()
             } catch {
@@ -2851,40 +3115,15 @@ class UserConnector {
             this.logger(
               `${id} ${userId} Kraken auth rejected (${errorMsg}); circuit-broken for ${Math.round(
                 cooldownMs / 1000,
-              )}s — no reconnect, no flap alert ${api.provider}`,
+              )}s (strike ${strikes}) — no reconnect, no flap alert ${api.provider}`,
               true,
             )
-            // Tell main-app (which already consumes serviceLog for
-            // userStreamFlap) so the user gets a bot-message warning —
-            // otherwise the degradation stays invisible to them. Emit-only.
-            try {
-              this.redis?.publish(
-                serviceLogRedis,
-                JSON.stringify({
-                  userStreamAuthReject: {
-                    exchange: api.provider,
-                    userId,
-                    reason: errorMsg,
-                  },
-                }),
-              )
-            } catch {
-              /* emit-only: a publish failure must never affect the breaker */
-            }
+            this.publishAuthRejectNotice(api.provider, userId, errorMsg)
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
-            // simply re-arms the cooldown.
-            if (subs) {
-              setTimeout(() => {
-                if ((this.authCooldownUntil.get(id) ?? 0) <= Date.now()) {
-                  this.authCooldownUntil.delete(id)
-                  ;[...Array(subs)].forEach(() =>
-                    this.openStreamCallback(msg, uuid),
-                  )
-                }
-              }, cooldownMs)
-            }
+            // simply re-arms the cooldown, one step longer.
+            this.scheduleAuthSelfHeal(id, subs, msg, uuid, cooldownMs)
           })
 
           /** Save user id and close function in users array */
@@ -3106,12 +3345,21 @@ class UserConnector {
     if (uuid) {
       const find = this.subscribersMap.get(uuid)
       if (!find) {
+        // A circuit-broken room is exactly this state: the breaker already
+        // deleted its subscriber count and user entry, so an unsubscribe for
+        // it lands here. It still owns a pending self-heal retry and its
+        // subscribe payload — drop both, or a connection the user removed
+        // gets a stream reopened for it after the cooldown, forever.
+        this.forgetSubscription(uuid)
         this.removeAccountFromWatchlist(uuid)
         return this.logger(`${uuid} has no subscribers`, true)
       }
       const left = find - 1
       this.subscribersMap.set(uuid, left)
       if (!left) {
+        // Last subscriber gone: this room is being torn down, so nothing
+        // should be able to reopen it on its own afterwards.
+        this.forgetSubscription(uuid)
         const user = this.users.find((us) => us.id === uuid)
         /** Is user found */
         if (user) {
@@ -3177,6 +3425,12 @@ class UserConnector {
     ) {
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
+      // The key is provably authorized ⇒ the strike run is over. A later
+      // rejection starts again at the base cooldown rather than inheriting a
+      // multi-hour backoff earned before the key was fixed.
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
+      this.releaseAuthCooldownLogLatch(id)
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
@@ -3827,6 +4081,32 @@ class UserConnector {
       return msg.fills.map((fill: any) => {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
+        // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
+        // ExecutionReport.totalTradeQuantity is the contract's CUMULATIVE
+        // executed quantity — main-app assigns it straight to
+        // `order.executedQty`. An order that filled in two chunks therefore
+        // arrived as PARTIALLY_FILLED 0.037 then FILLED 0.033: the deal booked
+        // 0.033 of a 0.07 close, kept a phantom 0.037 residual, and chased it
+        // forever with reduce-only orders Kraken rejects as
+        // `wouldNotReducePosition`. Accumulate per order id (deduped by
+        // fill_id, so a redelivered fill cannot double-count) and emit the
+        // running totals.
+        const orderKey = `${fill.order_id || fill.cli_ord_id || ''}`
+        const fillQty = +fill.qty || 0
+        const fillPrice = +fill.price || 0
+        const remaining = +fill.remaining_order_qty || 0
+        const totals = krakenFillTotals.get(orderKey) ?? {
+          qty: 0,
+          cost: 0,
+          fillIds: new Set<string>(),
+        }
+        const fillId = `${fill.fill_id ?? fill.seq ?? ''}`
+        if (!totals.fillIds.has(fillId)) {
+          totals.fillIds.add(fillId)
+          totals.qty += fillQty
+          totals.cost += fillQty * fillPrice
+        }
+        krakenFillTotals.set(orderKey, totals)
         return {
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
@@ -3838,12 +4118,12 @@ class UserConnector {
             fill.remaining_order_qty === 0 ? 'FILLED' : 'PARTIALLY_FILLED',
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
-          price: `${fill.price || 0}`,
-          quantity: `${fill.qty || 0}`,
+          price: `${fillPrice}`,
+          quantity: `${totals.qty + remaining}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
-          totalQuoteTradeQuantity: `${(fill.price || 0) * (fill.qty || 0)}`,
-          totalTradeQuantity: `${fill.qty || 0}`,
+          totalQuoteTradeQuantity: `${totals.cost}`,
+          totalTradeQuantity: `${totals.qty}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
           liquidation: false,
         }
