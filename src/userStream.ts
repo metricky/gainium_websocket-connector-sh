@@ -1,4 +1,8 @@
 import { convert, convertFutures } from './utils/binance'
+import {
+  krakenOpenOrderFill,
+  krakenOpenOrdersRemovalIsFill,
+} from './utils/krakenOpenOrders'
 import { WebsocketAPIClient, WebsocketClient } from 'binance'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
@@ -198,6 +202,21 @@ export interface AssetBalance {
   asset: string
   free: string
   locked: string
+  /**
+   * The venue's OWN figure for how much of this asset is currently spendable,
+   * when it publishes one. Optional and additive: every producer that has no
+   * such figure simply omits it, and a consumer that does not know the field
+   * keeps working unchanged.
+   *
+   * This exists because `free`/`locked` cannot describe a pooled
+   * cross-collateral account. On Kraken Futures' flex account every currency
+   * margins every contract, so there is no per-currency reservation to report
+   * and `free` carries the wallet quantity with `locked` at 0. The difference
+   * `free - venueAvailable` is then the margin the venue has actually
+   * committed — the only figure that reveals a position the engine is not
+   * tracking, which is otherwise invisible until an order is rejected.
+   */
+  venueAvailable?: string
 }
 
 export interface OutboundAccountPosition {
@@ -598,6 +617,13 @@ const HL_FILL_REST_RETRY_DELAY_MS =
 
 const LAST_STREM_EVENT_TIME_KEY = 'stream:lastEventTime'
 
+// Consecutive Kraken WS failures that never reached an open socket before the
+// transport breaker takes over from the SDK's own reconnect loop (bug #534).
+// Low enough that a real outage is damped within seconds, high enough that a
+// one-off blip reconnects normally and never parks a healthy room.
+const KRAKEN_TRANSPORT_FAILURE_THRESHOLD =
+  Number(process.env.USER_STREAM_TRANSPORT_FAILURE_THRESHOLD) || 4
+
 class UserConnector {
   private krakenLastUpdate: { spot: number; usdm: number } = {
     spot: 0,
@@ -660,6 +686,15 @@ class UserConnector {
    *  have its retry cancelled — otherwise the timer resurrects a stream for a
    *  credential that no longer exists, forever. */
   private authRetryTimers: Map<string, NodeJS.Timeout> = new Map()
+  /** Consecutive transport-level (non-auth) WS failures per room id, reset the
+   *  moment the socket opens. Counts failures that never reached an open
+   *  socket — a venue 503/1006 on the upgrade — so a healthy-but-flappy stream
+   *  (which does open, and is the flap detector's business) can never trip the
+   *  breaker below. */
+  private transportFailures: Map<string, number> = new Map()
+  /** Consecutive transport cooldown cycles per room id, driving the escalating
+   *  re-open backoff (see `transportCooldownMs`). */
+  private transportStrikes: Map<string, number> = new Map()
   private kucoinSymbols: { coinm: KucoinSymbol[]; usdm: KucoinSymbol[] } = {
     coinm: [],
     usdm: [],
@@ -1169,6 +1204,100 @@ class UserConnector {
   }
 
   /**
+   * Cooldown length for the Nth consecutive transport (venue-outage) breaker
+   * cycle of a room: base 5s doubled per prior strike, capped at 60s — 5s, 10s,
+   * 20s, 40s, 60s, 60s…
+   *
+   * Deliberately three orders of magnitude shorter than `authCooldownMs`: a
+   * revoked key never heals on its own, but a venue 503 heals the moment the
+   * venue does, and this room is a user's live order/balance feed. The cap is
+   * what bounds the damage (one attempt per room per minute while the outage
+   * lasts, instead of ~120), and it also bounds the recovery lag to ≤60s once
+   * Kraken comes back — callers re-requesting the room recover it sooner, since
+   * the gate in `openStreamCallback` lets them through the moment it lapses.
+   */
+  private transportCooldownMs(strikes: number) {
+    const base = Math.max(
+      1_000,
+      Number(process.env.USER_STREAM_TRANSPORT_COOLDOWN_MS) || 5_000,
+    )
+    const cap = Math.max(
+      base,
+      Number(process.env.USER_STREAM_TRANSPORT_COOLDOWN_MAX_MS) || 60_000,
+    )
+    // Same exponent clamp as authCooldownMs — strikes is unbounded over a
+    // process lifetime and 2 ** 1024 is Infinity.
+    return Math.min(base * 2 ** Math.min(strikes, 20), cap)
+  }
+
+  /**
+   * Reconnect delay handed to the Kraken SDK, jittered per client.
+   *
+   * `@siebly/kraken-api` defaults `reconnectTimeout` to a flat 500ms and reads
+   * it fresh at all three of its reconnect call sites, so it never escalates:
+   * during the 2026-08-27 derivatives outage that was ~2 upgrade attempts a
+   * second per room, indefinitely, at a venue that was already rate-limiting us
+   * (bug #534). The price-side connector hit the identical defect in bug #196
+   * and fixed it by passing the shared 3500ms knob (`price/kraken.ts`); the
+   * user-stream client was never given one. Same knob here.
+   *
+   * The jitter matters more here than on the price side: every room fails at
+   * the same instant during a venue outage, so a fixed delay marches all ~115
+   * of them into the venue in lockstep forever. Jitter is per-client (drawn
+   * once at construction) which is enough to spread the fleet.
+   */
+  private krakenReconnectTimeoutMs() {
+    const base = Math.max(
+      500,
+      Number(process.env.USER_STREAM_KRAKEN_RECONNECT_MS) || 3_500,
+    )
+    return base + Math.floor(Math.random() * Math.round(base / 2))
+  }
+
+  /**
+   * Classify a Kraken `exception` payload as a transport failure — the venue
+   * refused or dropped the socket itself, with no opinion about our
+   * credentials. Checked only AFTER `isKrakenAuthReject`, so an auth rejection
+   * can never land here.
+   *
+   * Matched against the exception payload AND the SDK's own error text, because
+   * for the upgrade-rejection case the payload alone is just `{wsKey}` — see the
+   * `lastSdkErrorText` note at the Kraken client construction. These are the
+   * shapes `BaseWSClient.parseWsError()` produces for a venue outage: the HTTP
+   * status of a refused upgrade, abnormal closes as 1006, and DNS/TCP faults as
+   * node syscall codes.
+   */
+  private isKrakenTransportFailure(errorMsg: string) {
+    return (
+      /Unexpected server response:\s*(5\d\d|429)/i.test(errorMsg) ||
+      /\b1006\b/.test(errorMsg) ||
+      /Connection failed/i.test(errorMsg) ||
+      /socket hang up/i.test(errorMsg) ||
+      /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EPIPE)\b/.test(
+        errorMsg,
+      )
+    )
+  }
+
+  /**
+   * Arm (or re-arm) the transport breaker for a room and return the cooldown it
+   * earned. Mirrors `armAuthCooldown` — including reusing `authCooldownUntil`
+   * as the single "this room is gated" map, so the `openStreamCallback` gate,
+   * the skip-log latch, the flap-alert suppression in `noteReconnect` and the
+   * recovery clear in `userStreamEvent` all apply unchanged — but escalates on
+   * its own, much shorter ladder.
+   */
+  private armTransportCooldown(id: string, now = Date.now()) {
+    const strikes = this.transportStrikes.get(id) ?? 0
+    const cooldownMs = this.transportCooldownMs(strikes)
+    this.transportStrikes.set(id, strikes + 1)
+    this.transportFailures.delete(id)
+    this.authCooldownUntil.set(id, now + cooldownMs)
+    this.releaseAuthCooldownLogLatch(id)
+    return { cooldownMs, strikes: strikes + 1 }
+  }
+
+  /**
    * Classify a Kraken `exception` payload as a deterministically-fatal
    * credential rejection. Three shapes, none of which heals by retrying:
    *  - "EGeneral:Permission denied" — the WS-token REST call was rejected
@@ -1301,6 +1430,8 @@ class UserConnector {
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
       this.authCooldownSkipsSuppressed.delete(id)
+      this.transportFailures.delete(id)
+      this.transportStrikes.delete(id)
     }
   }
 
@@ -1642,10 +1773,23 @@ class UserConnector {
               await wsAPI.subscribeUserDataStream('mainWSAPI')
             }
             stopMethod = async () => {
-              wsAPI.unsubscribeUserDataStream('mainWSAPI')
               //@ts-ignore
               client.respawnUserDataStream = (...args: unknown[]) =>
                 new Promise((resolve) => resolve)
+              // Actually close the socket, like every other provider's
+              // stopMethod does. `unsubscribeUserDataStream()` only sends a
+              // `userDataStream.unsubscribe` WS-API request: it leaves the
+              // `mainWSAPI` connection in the SDK's WsStore with auto-reconnect
+              // armed, and — because it awaits the connection — it re-opens the
+              // socket if it is already down. A torn-down room therefore kept
+              // reconnecting to Binance for hours with this room's
+              // `reconnected` listener still attached, so `noteReconnect()`
+              // counted phantom reconnects for a stream that no longer existed
+              // and raised `stream_flap` (bug #433). Closing the connection IS
+              // the unsubscribe here: a WS-API user data stream is bound to its
+              // connection, and `close()` marks the socket CLOSING so the SDK
+              // neither reconnects nor resubscribes.
+              client.closeAll(false)
             }
           } else {
             client = new WebsocketClient(
@@ -1820,10 +1964,16 @@ class UserConnector {
           }
         })
         /** Open stream and set callback  */
+        let opened = false
         try {
           let connectTimer: NodeJS.Timeout | undefined
+          const started = startMethod()
+          // The race's loser can still settle later — a subscribe that fails
+          // after the connect timeout already won would otherwise surface as
+          // an unhandled rejection. The race still sees the real rejection.
+          started.catch(() => null)
           await Promise.race([
-            startMethod(),
+            started,
             new Promise<void>((_, reject) => {
               connectTimer = setTimeout(() => {
                 this.logger(
@@ -1836,6 +1986,7 @@ class UserConnector {
           ]).finally(() => {
             if (connectTimer) clearTimeout(connectTimer)
           })
+          opened = true
 
           /** Save user id and close function in users array */
           findUser = { ...findUser, close: stopMethod }
@@ -1852,6 +2003,19 @@ class UserConnector {
           )
           await this.paceAfterOpen(api.provider)
         } catch (err) {
+          // The client was created and this room's listeners are attached, but
+          // the subscribe never completed, so the room is not registered in
+          // `users`/`subscribersMap` and the next request builds a *new*
+          // client. Close this one, or it stays in the SDK's WsStore
+          // auto-reconnecting forever and keeps firing this room's
+          // `reconnected` handler → `noteReconnect()` → `stream_flap` alerts
+          // for a room with no stream (bug #433: a Binance key rejected with
+          // -2015 leaked one such client per failed attempt). Guarded on
+          // `opened` so a throw from the post-open bookkeeping can never close
+          // a stream that is already registered and serving the room.
+          if (!opened) {
+            await stopMethod().catch(() => null)
+          }
           findUser = { ...findUser, pending: false }
           this.saveUser(findUser)
           return this.logger(
@@ -2955,12 +3119,28 @@ class UserConnector {
         try {
           const isDemo = process.env.KRAKEN_ENV === 'demo'
           const isFutures = api.provider === ExchangeEnum.krakenUsdm
+          // `BaseWSClient.parseWsError()` emits the exception as
+          // `{ ...error, wsKey }`, and a `ws` ErrorEvent keeps `message` on its
+          // prototype — so the payload our `exception` handler receives for a
+          // venue 503 is literally `{"wsKey":"derivativesPrivateV1"}`, with the
+          // status spread away. (The auth breaker is unaffected: its shapes come
+          // from the `requestSubscribeTopics` monkeypatch at the top of this
+          // file, which builds an own `message` property explicitly.) The status
+          // survives in exactly one place — the text handed to the `error`
+          // logger adapter below, which parseWsError calls immediately before
+          // emitting. Stash it so the transport breaker can classify.
+          let lastSdkErrorText = ''
           /** New exchange instance */
           const client = new KrakenWsClient(
             {
               apiKey: api.key,
               apiSecret: api.secret,
               ...(isFutures && isDemo && { testnet: true }),
+              // Without this the SDK reconnects on its flat 500ms default,
+              // forever — see `krakenReconnectTimeoutMs` (bug #534). This is
+              // the floor between attempts; the breaker in the `exception`
+              // handler below is what escalates once the venue is clearly down.
+              reconnectTimeout: this.krakenReconnectTimeoutMs(),
             },
             {
               trace: () => null,
@@ -2977,11 +3157,13 @@ class UserConnector {
                 this.logger(
                   `${id} Kraken info: ${safeStringify(args)} ${api.provider}`,
                 ),
-              error: (...args) =>
+              error: (...args) => {
+                lastSdkErrorText = safeStringify(args)
                 this.logger(
-                  `${id} Kraken error: ${safeStringify(args)} ${api.provider}`,
+                  `${id} Kraken error: ${lastSdkErrorText} ${api.provider}`,
                   true,
-                ),
+                )
+              },
             },
           )
 
@@ -3055,10 +3237,19 @@ class UserConnector {
           })
 
           client.on('open', () => {
+            // Reaching an open socket ends the transport-failure run: whatever
+            // the venue was doing, it is answering upgrades again.
+            this.transportFailures.delete(id)
+            lastSdkErrorText = ''
             this.logger(`${id} Kraken ws connection opened ${api.provider}`)
           })
 
           client.on('authenticated', () => {
+            // A fully-authenticated stream also ends the strike run, so the
+            // next outage starts again at the base cooldown rather than
+            // inheriting a minute-long backoff earned during the last one.
+            this.transportFailures.delete(id)
+            this.transportStrikes.delete(id)
             this.logger(`${id} Kraken ws authenticated ${api.provider}`)
           })
 
@@ -3096,6 +3287,59 @@ class UserConnector {
             // threshold would never trip — break the circuit on first sight.
             const isAuthReject = this.isKrakenAuthReject(errorMsg)
             if (!isAuthReject) {
+              // Transport-failure breaker (bug #534). The SDK retries a venue
+              // 503 on a flat delay indefinitely, and every room fails at once
+              // during an outage — 19min of Kraken downtime cost 83k error
+              // lines and ~2k upgrade attempts a minute at a venue that was
+              // already rate-limiting us. Once a room has failed this many
+              // times WITHOUT ever reaching an open socket, stop letting the
+              // SDK drive and re-open it ourselves on a widening interval.
+              if (
+                !this.isKrakenTransportFailure(
+                  `${errorMsg} ${lastSdkErrorText}`,
+                )
+              ) {
+                return
+              }
+              const fails = (this.transportFailures.get(id) ?? 0) + 1
+              this.transportFailures.set(id, fails)
+              // The threshold only buys the FIRST cycle its benefit of the
+              // doubt. Once a room is a known-bad transport, its post-cooldown
+              // retry failing again is all the evidence needed — otherwise
+              // every cooldown step re-burns a full threshold of attempts and
+              // the steady state stays 4x noisier than the ladder implies.
+              const threshold =
+                (this.transportStrikes.get(id) ?? 0) > 0
+                  ? 1
+                  : KRAKEN_TRANSPORT_FAILURE_THRESHOLD
+              if (
+                fails < threshold ||
+                (this.authCooldownUntil.get(id) ?? 0) > Date.now()
+              ) {
+                return
+              }
+              const { cooldownMs, strikes } = this.armTransportCooldown(id)
+              try {
+                close()
+              } catch {
+                /* closing a half-open client must never throw */
+              }
+              this.users = this.users.filter((u) => u.id !== id)
+              const transportSubs = this.subscribersMap.get(id)
+              this.subscribersMap.delete(id)
+              this.logger(
+                `${id} ${userId} Kraken transport failure (${errorMsg}) x${fails}; ` +
+                  `paused for ${Math.round(cooldownMs / 1000)}s (strike ${strikes}) ` +
+                  `— venue unreachable, backing off ${api.provider}`,
+                true,
+              )
+              this.scheduleAuthSelfHeal(
+                id,
+                transportSubs,
+                msg,
+                uuid,
+                cooldownMs,
+              )
               return
             }
             // A futures subscribe rejects each of its 3 topics in one burst;
@@ -3430,6 +3674,9 @@ class UserConnector {
       // multi-hour backoff earned before the key was fixed.
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
+      // A real account event also proves the transport is up end-to-end.
+      this.transportFailures.delete(id)
+      this.transportStrikes.delete(id)
       this.releaseAuthCooldownLogLatch(id)
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
@@ -3578,10 +3825,20 @@ class UserConnector {
               newClientOrderId: order.client_order_id,
               orderId: order.order_id,
               orderTime: updateTime,
+              // Coinbase has no PARTIALLY_FILLED status: a resting order that
+              // has taken some size stays OPEN and reports the progress in
+              // `cumulative_quantity`. Mapping OPEN straight to NEW means we
+              // never emit PARTIALLY_FILLED for this venue at all, so a
+              // consumer that books partial fills (a TP that fills part way
+              // before being resized) never hears about the executed part and
+              // keeps counting base the account no longer holds. The bybit and
+              // bitget mappers below both make this distinction explicitly.
               orderStatus:
                 order.status === OrderStatus.PENDING ||
                 order.status === OrderStatus.OPEN
-                  ? ('NEW' as const)
+                  ? +order.cumulative_quantity > 0
+                    ? ('PARTIALLY_FILLED' as const)
+                    : ('NEW' as const)
                   : order.status === OrderStatus.FILLED
                     ? ('FILLED' as const)
                     : ('CANCELED' as const),
@@ -4132,7 +4389,14 @@ class UserConnector {
 
     // Kraken futures open_orders format
     if (channel === 'open_orders') {
-      // Cancellation: { feed: 'open_orders', order_id, cli_ord_id, is_cancel: true, reason: 'cancelled_by_user' }
+      // Removal: { feed: 'open_orders', order_id, cli_ord_id, is_cancel: true, reason: 'cancelled_by_user' }
+      // `is_cancel` also marks a FULLY FILLED order leaving the book
+      // (`reason: 'full_fill'`). The fill itself arrives on the `fills` feed
+      // with quantity and price; relaying this as CANCELED would mark a filled
+      // order dead — the exact shape that has cost untracked positions before.
+      if (msg.is_cancel === true && krakenOpenOrdersRemovalIsFill(msg.reason)) {
+        return []
+      }
       if (msg.is_cancel === true) {
         const symbol = '' // Symbol not provided in cancellation message
         return [
@@ -4165,6 +4429,12 @@ class UserConnector {
           maps.wsnameToNormalized.get(order.instrument) ||
           order.instrument ||
           ''
+        // `order.qty` here is the quantity STILL OPEN, not the size placed.
+        // Read as the total it turned a partial execution into FILLED at the
+        // partial amount (`filled >= qty`), and the engine answered with a
+        // market remainder that the original order then doubled up on. See
+        // utils/krakenOpenOrders.ts.
+        const fill = krakenOpenOrderFill(order)
         return [
           {
             creationTime: order.time || Date.now(),
@@ -4173,20 +4443,15 @@ class UserConnector {
             newClientOrderId: order.cli_ord_id || order.order_id || '',
             orderId: order.order_id || '',
             orderTime: order.last_update_time || Date.now(),
-            orderStatus:
-              order.filled > 0
-                ? order.filled >= order.qty
-                  ? 'FILLED'
-                  : 'PARTIALLY_FILLED'
-                : 'NEW',
+            orderStatus: fill.status,
             orderType: order.type === 'limit' ? 'LIMIT' : 'MARKET',
             originalClientOrderId: order.cli_ord_id || order.order_id || '',
             price: `${order.limit_price || order.stop_price || 0}`,
-            quantity: `${order.qty || 0}`,
+            quantity: `${fill.total}`,
             side: order.direction === 1 ? 'BUY' : 'SELL',
             symbol,
             totalQuoteTradeQuantity: '0',
-            totalTradeQuantity: `${order.filled || 0}`,
+            totalTradeQuantity: `${fill.filled}`,
             uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
             liquidation: false,
           },
@@ -4265,13 +4530,43 @@ class UserConnector {
         locked: '0',
       }))
     } else if (typeof data === 'object' && 'flex_futures' in data) {
-      // Handle object format: { BTC: { balance: '1.0', hold_balance: '0.1' }, ... }
+      // Kraken Futures' flex account pools EVERY collateral currency into one
+      // cross-margin pool, so there is no per-currency reservation to report:
+      // margin is committed against the portfolio, never against a currency.
+      //
+      // `locked` used to be derived here as `quantity - available`. That is not
+      // the reservation it looks like. `available` is absent from Kraken's own
+      // REST schema for a flex currency summary (`{quantity, value,
+      // collateral}`) and was read through `as any`, so the mapping was never
+      // type-checked; on prod it produced a `locked` between 1.8x and 93x the
+      // account's actual open exposure, including on accounts with no open
+      // positions at all, and it fought the REST writer of the same `balances`
+      // doc — which reports the wallet quantity as fully free — so the stored
+      // balance meant whichever write landed last.
+      //
+      // Report the wallet quantity and leave `locked` at 0, matching that REST
+      // writer. The figure the venue actually enforces is `flex.availableMargin`,
+      // which main-app reads through `getMarginAvailableUsd`.
+      //
+      // Kraken's per-currency `available` is still carried, as `venueAvailable`,
+      // because it is the venue's own view of what is spendable and nothing else
+      // reports it continuously. `free - venueAvailable` is the margin Kraken has
+      // actually committed, so a position the engine is not tracking shows up as
+      // committed margin with no deal behind it — otherwise invisible until an
+      // order is rejected. Deliberately NOT folded back into `locked`: that field
+      // has one meaning shared with the REST writer, which cannot produce this.
       balances = Object.entries(data.flex_futures.currencies).map(
-        ([currency, info]) => ({
-          asset: maps.assetNameMap.get(currency) || currency,
-          free: `${(info as any).available}`,
-          locked: `${(info as any).quantity - (info as any).available}`,
-        }),
+        ([currency, info]) => {
+          const available = (info as any).available
+          return {
+            asset: maps.assetNameMap.get(currency) || currency,
+            free: `${(info as any).quantity}`,
+            locked: '0',
+            ...(typeof available === 'number' && isFinite(available)
+              ? { venueAvailable: `${available}` }
+              : {}),
+          }
+        },
       )
     }
 
