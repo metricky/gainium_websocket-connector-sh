@@ -66,6 +66,14 @@ const isAll = priceRole === 'all'
 const BEACON_INTERVAL_MS = 60 * 1000
 
 /**
+ * How often the dropped-candle-request warning repeats per exchange. Long on
+ * purpose: the condition it reports is a configuration state that persists for
+ * the life of the process, so the first line is the useful one and the rest
+ * only prove it is still true.
+ */
+const DROP_LOG_EVERY_MS = 30 * 60 * 1000
+
+/**
  * Incremented per Connector instance so an in-process rebuild (the
  * unhandledRejection/uncaughtException handlers in index.price call
  * `stop()` then construct a fresh Connector) gets its own boot id — it
@@ -173,8 +181,24 @@ class Connector {
   get isBinance() {
     return this.isFamilyNeeded('binance')
   }
+  /**
+   * binanceUS has no worker of its own — `FAMILY_VARIANTS.binance` serves it —
+   * so the family gate has to answer first, with the same `binance`/`binanceus`
+   * env alias and the same admin-config precedence as every sibling venue. It
+   * then gets the variant-level admin-config gate `subscribeCandleCb` already
+   * applies below, so an operator who unticks Binance US keeps it off while
+   * Binance intl stays up.
+   *
+   * Read only by `initWorker` (as the worker payload's `binance.isUs`) and by
+   * `init`. When it is false the binance worker still spawns for the intl
+   * variants, but `binance.ts` never opens the binance.us ticker or candle
+   * socket — no ticks, no candles, and no log line either way.
+   */
   get isBinanceUS() {
-    return exchanges.length ? exchanges.includes('binanceus') : true
+    return (
+      this.isFamilyNeeded('binance') &&
+      isExchangeEnabled(ExchangeEnum.binanceUS)
+    )
   }
   get isBybit() {
     return this.isFamilyNeeded('bybit')
@@ -196,6 +220,58 @@ class Connector {
   }
   get isKraken() {
     return this.isFamilyNeeded('kraken')
+  }
+
+  /**
+   * One line at boot naming which families this process will stream and which
+   * it will not, and why.
+   *
+   * A family that is gated off is otherwise completely silent: no worker is
+   * constructed, so nothing logs, and every downstream effect is an absence —
+   * no `trade@<symbol>@<family>` ticks for consumers to react to, and every
+   * `candlesRequests` message for it dropped by `subscribeCandleCb` below.
+   * Production ran for months with one family missing from
+   * `PRICE_CONNECTOR_EXCHANGES` and the only visible symptom was downstream:
+   * bots on that exchange fell back to their 2.5-minute REST price poll, so
+   * take-profit level checks ran on a ~5-minute cadence instead of per tick.
+   * The allow-list is legitimate configuration; being unable to see it from
+   * this process's log is not.
+   */
+  private logFamilySelection() {
+    const adminEnabled = getEnabledSnapshot()
+    const source = adminEnabled
+      ? 'admin-config'
+      : exchanges.length
+        ? 'PRICE_CONNECTOR_EXCHANGES'
+        : 'default (no allow-list — every family)'
+    const all = Object.keys(FAMILY_VARIANTS)
+    // binanceUS rides inside the `binance` family worker but is gated
+    // separately (its own WS host), so reporting families alone put it in
+    // NEITHER list — the line read `NOT streaming: (none)` while the venue was
+    // dark. Report it as its own unit.
+    const units = [
+      ...all.map((f) => ({ label: f, on: this.isFamilyNeeded(f) })),
+      { label: ExchangeEnum.binanceUS as string, on: this.isBinanceUS },
+    ]
+    const on = units.filter((u) => u.on).map((u) => u.label)
+    const off = units.filter((u) => !u.on).map((u) => u.label)
+    logger.info(
+      `Price connector families [${source}] | streaming: ${
+        on.join(',') || '(none)'
+      } | NOT streaming: ${off.join(',') || '(none)'}`,
+    )
+    if (!adminEnabled && exchanges.length) {
+      const unknown = exchanges.filter(
+        (e) => !all.includes(e) && e !== 'binanceus',
+      )
+      if (unknown.length) {
+        logger.warn(
+          `PRICE_CONNECTOR_EXCHANGES lists unknown families: ${unknown.join(
+            ',',
+          )} — known: ${all.join(',')},binanceus`,
+        )
+      }
+    }
   }
 
   constructor() {
@@ -263,6 +339,36 @@ class Connector {
     this.subscribedCandlesMap.delete(workerKey)
   }
 
+  /**
+   * One warning per exchange per process for candle requests we throw away,
+   * then a periodic reminder carrying the running count. Never per symbol:
+   * a single main-app boot re-requests thousands.
+   */
+  private droppedCandleRequests: Map<
+    string,
+    { count: number; lastLogged: number }
+  > = new Map()
+
+  private warnDroppedCandleRequest(
+    exchange: string,
+    symbol: string,
+    why: string,
+  ) {
+    const state = this.droppedCandleRequests.get(exchange) ?? {
+      count: 0,
+      lastLogged: 0,
+    }
+    state.count += 1
+    const now = +new Date()
+    if (state.lastLogged === 0 || now - state.lastLogged >= DROP_LOG_EVERY_MS) {
+      state.lastLogged = now
+      logger.warn(
+        `Dropping candle subscription for ${exchange} (e.g. ${symbol}): ${why}. ${state.count} request(s) dropped for ${exchange} so far in this process.`,
+      )
+    }
+    this.droppedCandleRequests.set(exchange, state)
+  }
+
   private subscribeCandleCb() {
     return ({
       symbol,
@@ -289,9 +395,29 @@ class Connector {
         return
       }
       const workerKey = VARIANT_TO_WORKER_KEY[exchange]
-      if (!workerKey) return
+      if (!workerKey) {
+        this.warnDroppedCandleRequest(
+          exchange,
+          symbol,
+          'no worker family maps this exchange',
+        )
+        return
+      }
       const worker = this.workers.get(workerKey)
-      if (!worker) return
+      if (!worker) {
+        // Silent until now, and the silence is the whole problem: main-app
+        // re-requests every subscription after each connector restart, so a
+        // family with no worker discards thousands of requests per boot
+        // without a single log line. Rate-limited to one line per exchange
+        // per process — the drop is a configuration fact, not a per-symbol
+        // event, and the count is carried on the line.
+        this.warnDroppedCandleRequest(
+          exchange,
+          symbol,
+          'family worker not running (exchange not in the enabled set)',
+        )
+        return
+      }
       worker.postMessage({
         do: 'subscribeCandle',
         data: { symbol, interval, exchange },
@@ -393,6 +519,7 @@ class Connector {
   }
 
   async init() {
+    this.logFamilySelection()
     if (isCandle || isAll) {
       // Fire-and-forget: `announceBoot` awaits a Redis client, and
       // `RedisClient.getInstance()` retries indefinitely, so awaiting it here

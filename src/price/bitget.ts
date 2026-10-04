@@ -11,6 +11,18 @@ import {
   WsTopicSubscribeEventArgsV2,
 } from 'bitget-api'
 import { WebsocketClientV2 as WSClient } from '../../bitget-custom/websocket-client-v2'
+import { WebsocketClientV3Public } from '../../bitget-custom/websocket-client-v3-public'
+import {
+  bitgetRealityKlineInterval,
+  getBitgetRealitySymbols,
+} from '../utils/bitgetReality'
+import {
+  bitgetInverseKlineInterval,
+  bitgetInversePlatformSymbol,
+  bitgetInverseVenueSymbol,
+  getBitgetInversePerps,
+  splitBitgetCoinmMarkets,
+} from '../utils/bitgetInverse'
 import getAllExchangeInfo from '../utils/exchange'
 import CommonConnector from './common'
 
@@ -102,6 +114,34 @@ class BitgetConnector extends CommonConnector {
       id: 0,
     },
   ]
+  /**
+   * Reality stock token candles. v2 accepts `candle*` subscriptions for them
+   * and never pushes; the v3 `kline` topic does. See utils/bitgetReality.ts.
+   */
+  private bitgetClientCandleReality: {
+    client: WebsocketClientV3Public
+    subs: number
+    id: number
+  }[] = [{ client: this.getBitgetRealityClient(), subs: 0, id: 0 }]
+  /**
+   * Inverse perpetuals (`BTCUSD`). The venue moved them to its unified line,
+   * where v2 quotes neither their tickers nor their candles; both come from
+   * the v3 topics under the `_CM` name. See utils/bitgetInverse.ts.
+   */
+  private bitgetClientV3CoinmTicker: {
+    client: WebsocketClientV3Public
+    subs: number
+    id: number
+  }[] = []
+  private bitgetClientV3CoinmCandle: {
+    client: WebsocketClientV3Public
+    subs: number
+    id: number
+  }[] = []
+  /** `${symbol}|${v3 interval}` → the v2 channel name main-app subscribed. */
+  private realityChannels: Map<string, string> = new Map()
+  /** The same, for the inverse perpetuals, keyed by their venue name. */
+  private inverseChannels: Map<string, string> = new Map()
   private timer: Map<Market, NodeJS.Timeout | null> = new Map()
   private inQueueCandles: Map<Market, Map<string, MapValue>> = new Map()
 
@@ -145,6 +185,211 @@ class BitgetConnector extends CommonConnector {
         )
       }
     }
+  }
+
+  private bitgetRealityCandleCb(msg: any) {
+    if (msg.arg?.topic !== 'kline' || msg.action !== 'update') {
+      return
+    }
+    const channel = this.realityChannels.get(
+      `${msg.arg.symbol}|${msg.arg.interval}`,
+    )
+    const candle = msg.data?.[msg.data.length - 1]
+    if (!channel || !candle) {
+      return
+    }
+    // Published on the v2 channel name, so main-app's subscription for the
+    // pair is unchanged. `turnover` is the quote volume, as v2's is.
+    this.cbWsTrade(
+      {
+        e: 'kline',
+        E: msg.ts,
+        s: msg.arg.symbol,
+        k: {
+          o: candle.open,
+          h: candle.high,
+          l: candle.low,
+          c: candle.close,
+          v: candle.turnover,
+          i: channel,
+          t: +candle.start,
+        },
+      },
+      ExchangeEnum.bitget,
+    )
+  }
+
+  /**
+   * The v3 public push for an inverse perpetual — ticker or candle. Both are
+   * published under the platform's own pair name (`BTCUSD`), on the same
+   * channels the classic stream used, so nothing downstream has to know the
+   * product moved.
+   */
+  private bitgetInverseCb(msg: any) {
+    const symbol = bitgetInversePlatformSymbol(`${msg?.arg?.symbol ?? ''}`)
+    if (!symbol) {
+      return
+    }
+    if (msg.arg?.topic === 'ticker' && msg.action === 'snapshot') {
+      const t = msg.data?.[0]
+      if (!t) {
+        return
+      }
+      this.cbWs(
+        [
+          {
+            eventType: '24hrMiniTicker',
+            eventTime: msg.ts,
+            curDayClose: t.lastPrice,
+            open: t.openPrice24h,
+            high: t.highPrice24h,
+            low: t.lowPrice24h,
+            volume: t.volume24h,
+            volumeQuote: t.turnover24h,
+            symbol,
+            bestBid: t.bid1Price,
+            bestAsk: t.ask1Price,
+            bestAskQnt: t.ask1Size,
+            bestBidQnt: t.bid1Size,
+          },
+        ],
+        ExchangeEnum.bitgetCoinm,
+      )
+      return
+    }
+    if (msg.arg?.topic !== 'kline' || msg.action !== 'update') {
+      return
+    }
+    const channel = this.inverseChannels.get(
+      `${msg.arg.symbol}|${msg.arg.interval}`,
+    )
+    const candle = msg.data?.[msg.data.length - 1]
+    if (!channel || !candle) {
+      return
+    }
+    this.cbWsTrade(
+      {
+        e: 'kline',
+        E: msg.ts,
+        s: symbol,
+        k: {
+          o: candle.open,
+          h: candle.high,
+          l: candle.low,
+          c: candle.close,
+          // `turnover` is the quote volume, as the classic stream's was.
+          v: candle.turnover,
+          i: channel,
+          t: +candle.start,
+        },
+      },
+      ExchangeEnum.bitgetCoinm,
+    )
+  }
+
+  private getBitgetInverseClient(
+    type: StreamType,
+    current?: WebsocketClientV3Public,
+  ) {
+    if (current) {
+      current.removeAllListeners()
+      current.closeAll(false)
+      current.on('exception', () => null)
+    }
+    const client = new WebsocketClientV3Public(
+      { reconnectTimeout: this.wsReconnect },
+      obsoleteWsLoggerOptions,
+    )
+    client.on('update', (msg) => this.bitgetInverseCb(msg))
+    client.on('open', this.commonWsOpenCb(ExchangeEnum.bitgetCoinm, type))
+    client.on('exception', this.bitgetRestartCb(ExchangeEnum.bitgetCoinm))
+    client.on(
+      'reconnected',
+      this.commonWsReconnectCb(ExchangeEnum.bitgetCoinm, type),
+    )
+    return client
+  }
+
+  /** One ticker subscription per inverse perpetual, on the v3 topic. */
+  private subscribeBitgetInverseTickers(symbols: string[]) {
+    for (const symbol of symbols) {
+      const topic = {
+        instType: 'coin-futures' as const,
+        topic: 'ticker' as const,
+        symbol: bitgetInverseVenueSymbol(symbol),
+      }
+      const cl = this.bitgetClientV3CoinmTicker
+        .filter((c) => c.subs < maxSubs)
+        .sort((a, b) => b.subs - a.subs)[0]
+      if (cl) {
+        cl.client.subscribe(topic)
+        cl.subs += 1
+        continue
+      }
+      const client = this.getBitgetInverseClient('ticker')
+      client.subscribe(topic)
+      const last =
+        this.bitgetClientV3CoinmTicker.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+      this.bitgetClientV3CoinmTicker.push({ client, subs: 1, id: last + 1 })
+    }
+  }
+
+  private subscribeBitgetInverseCandle(symbol: string, channel: string) {
+    const interval = bitgetInverseKlineInterval(channel)
+    if (!interval) {
+      logger.info(
+        `Bitget inverse ${symbol} has no ${channel} stream; closed candles come from the REST back-fill`,
+      )
+      return
+    }
+    const venue = bitgetInverseVenueSymbol(symbol)
+    const key = `${venue}|${interval}`
+    if (this.inverseChannels.has(key)) {
+      return
+    }
+    this.inverseChannels.set(key, channel)
+    if (!this.mainData[ExchangeEnum.bitgetCoinm]) {
+      this.mainData[ExchangeEnum.bitgetCoinm] = this.base
+    }
+    const topic = {
+      instType: 'coin-futures' as const,
+      topic: 'kline' as const,
+      symbol: venue,
+      interval,
+    }
+    const cl = this.bitgetClientV3CoinmCandle
+      .filter((c) => c.subs < maxSubs)
+      .sort((a, b) => b.subs - a.subs)[0]
+    if (cl) {
+      cl.client.subscribe(topic)
+      cl.subs += 1
+      return
+    }
+    const client = this.getBitgetInverseClient('candle')
+    client.subscribe(topic)
+    const last =
+      this.bitgetClientV3CoinmCandle.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+    this.bitgetClientV3CoinmCandle.push({ client, subs: 1, id: last + 1 })
+  }
+
+  private getBitgetRealityClient(current?: WebsocketClientV3Public) {
+    if (current) {
+      current.removeAllListeners()
+      current.closeAll(false)
+      current.on('exception', () => null)
+    }
+    const client = new WebsocketClientV3Public(
+      { reconnectTimeout: this.wsReconnect },
+      obsoleteWsLoggerOptions,
+    )
+    client.on('update', (msg) => this.bitgetRealityCandleCb(msg))
+    client.on('open', this.commonWsOpenCb(ExchangeEnum.bitget, 'candle'))
+    client.on('exception', this.bitgetRestartCb(ExchangeEnum.bitget))
+    client.on(
+      'reconnected',
+      this.commonWsReconnectCb(ExchangeEnum.bitget, 'candle'),
+    )
+    return client
   }
 
   private bitgetGetCallback(e: ExchangeEnum, type: StreamType) {
@@ -270,6 +515,29 @@ class BitgetConnector extends CommonConnector {
       subs: 0,
       id: bg.id,
     }))
+    this.bitgetClientCandleReality = this.bitgetClientCandleReality.map(
+      (bg) => ({
+        client: this.getBitgetRealityClient(bg.client),
+        subs: 0,
+        id: bg.id,
+      }),
+    )
+    this.realityChannels.clear()
+    this.bitgetClientV3CoinmTicker = this.bitgetClientV3CoinmTicker.map(
+      (bg) => ({
+        client: this.getBitgetInverseClient('ticker', bg.client),
+        subs: 0,
+        id: bg.id,
+      }),
+    )
+    this.bitgetClientV3CoinmCandle = this.bitgetClientV3CoinmCandle.map(
+      (bg) => ({
+        client: this.getBitgetInverseClient('candle', bg.client),
+        subs: 0,
+        id: bg.id,
+      }),
+    )
+    this.inverseChannels.clear()
   }
 
   private bitgetRestartCb(e?: ExchangeEnum) {
@@ -349,9 +617,21 @@ class BitgetConnector extends CommonConnector {
         )
       }
       /** coinm */
-      const marketsCoinm = await getAllExchangeInfo(ExchangeEnum.bitgetCoinm)
+      const allCoinmMarkets = await getAllExchangeInfo(ExchangeEnum.bitgetCoinm)
       if (!this.mainData[ExchangeEnum.bitgetCoinm]) {
         this.mainData[ExchangeEnum.bitgetCoinm] = this.base
+      }
+      // The perpetuals are quoted only on v3, and the market list above is
+      // built from the classic contract listing, which no longer carries
+      // them at all — so they are added from the venue's own v3 listing
+      // rather than filtered out of this one (utils/bitgetInverse.ts).
+      const { classic: marketsCoinm, inverse: inverseMarkets } =
+        splitBitgetCoinmMarkets(allCoinmMarkets, await getBitgetInversePerps())
+      if (inverseMarkets.length) {
+        this.subscribeBitgetInverseTickers(inverseMarkets)
+        logger.info(
+          `Subscribed to ${inverseMarkets.length} bitget inverse perpetual tickers on v3`,
+        )
       }
       i = 0
       chunks = marketsCoinm.reduce((acc, curr, i) => {
@@ -444,7 +724,7 @@ class BitgetConnector extends CommonConnector {
   private async reconnectBitgetCandleStream() {
     /** spot */
     const allSpot =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybit) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitget) ?? new Set()
     const storeSpot: string[][] = []
     allSpot.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -456,7 +736,7 @@ class BitgetConnector extends CommonConnector {
     )
     /** usdm */
     const allUsdm =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybitUsdm) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitgetUsdm) ?? new Set()
     const storeUsdm: string[][] = []
     allUsdm.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -468,7 +748,7 @@ class BitgetConnector extends CommonConnector {
     )
     /** coinm */
     const allCoinm =
-      this.subscribedCandlesMap.get(ExchangeEnum.bybitCoinm) ?? new Set()
+      this.subscribedCandlesMap.get(ExchangeEnum.bitgetCoinm) ?? new Set()
     const storeCoinm: string[][] = []
     allCoinm.forEach((s) => {
       if (s.indexOf('tickers') === -1) {
@@ -501,6 +781,22 @@ class BitgetConnector extends CommonConnector {
           : demo
             ? 'SCOIN-FUTURES'
             : 'COIN-FUTURES'
+    if (
+      !timer &&
+      market === 'spot' &&
+      (await getBitgetRealitySymbols()).has(symbol)
+    ) {
+      this.subscribeBitgetRealityCandle(symbol, interval)
+      return
+    }
+    if (
+      !timer &&
+      market === 'inverse' &&
+      (await getBitgetInversePerps()).has(symbol)
+    ) {
+      this.subscribeBitgetInverseCandle(symbol, interval)
+      return
+    }
     const t = this.timer.get(market)
     if (t) {
       clearTimeout(t)
@@ -621,6 +917,43 @@ class BitgetConnector extends CommonConnector {
         }
       }
     }
+  }
+
+  private subscribeBitgetRealityCandle(symbol: string, channel: string) {
+    const interval = bitgetRealityKlineInterval(channel)
+    if (!interval) {
+      logger.info(
+        `Bitget Reality ${symbol} has no ${channel} stream; closed candles come from the REST back-fill`,
+      )
+      return
+    }
+    const key = `${symbol}|${interval}`
+    if (this.realityChannels.has(key)) {
+      return
+    }
+    this.realityChannels.set(key, channel)
+    if (!this.mainData[ExchangeEnum.bitget]) {
+      this.mainData[ExchangeEnum.bitget] = this.base
+    }
+    const topic = {
+      instType: 'spot' as const,
+      topic: 'kline' as const,
+      symbol,
+      interval,
+    }
+    const cl = this.bitgetClientCandleReality
+      .filter((c) => c.subs < maxSubs)
+      .sort((a, b) => b.subs - a.subs)[0]
+    if (cl) {
+      cl.client.subscribe(topic)
+      cl.subs += 1
+      return
+    }
+    const client = this.getBitgetRealityClient()
+    client.subscribe(topic)
+    const last =
+      this.bitgetClientCandleReality.sort((a, b) => b.id - a.id)[0]?.id ?? 0
+    this.bitgetClientCandleReality.push({ client, subs: 1, id: last + 1 })
   }
 
   override stop() {

@@ -3,7 +3,9 @@ import {
   krakenOpenOrderFill,
   krakenOpenOrdersRemovalIsFill,
 } from './utils/krakenOpenOrders'
-import { WebsocketAPIClient, WebsocketClient } from 'binance'
+import { WebsocketClient } from 'binance'
+import { withLosslessOrderIds } from './binance-custom'
+import { createBinanceWsApiUserStream } from './binance-custom/wsApiUserStream'
 import * as hl from '@nktkas/hyperliquid'
 import KucoinApi from '@gainium/kucoin-api'
 import Coinbase, {
@@ -14,6 +16,7 @@ import Coinbase, {
   WebsocketUserMessage,
 } from 'coinbase-advanced-node'
 import crypto from 'crypto'
+import EventEmitter from 'events'
 import { CategoryV5 } from 'bybit-api'
 import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client'
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
@@ -112,6 +115,9 @@ import {
   reserveHyperliquidIp,
 } from './utils/hyperliquidIpRotation'
 import { HyperliquidUserClient } from './utils/hyperliquidUserClient'
+import HyperliquidSymbolMap, {
+  aliasHyperliquidToken,
+} from './utils/hyperliquidSymbols'
 import {
   HyperliquidFillParkResolver,
   ingestUserFills,
@@ -119,6 +125,15 @@ import {
 } from './utils/hyperliquidFillPark'
 import { exchangeUrl } from './utils/env'
 import axios from 'axios'
+import { WebsocketClientUta as BitgetUtaClient } from '../bitget-custom/websocket-client-uta'
+import {
+  BitgetAccountMode,
+  detectBitgetAccountMode,
+} from './utils/bitgetAccountMode'
+import {
+  bitgetInversePlatformSymbol,
+  bitgetInverseQtyUnit,
+} from './utils/bitgetInverse'
 
 const mutex = new IdMutex()
 
@@ -201,7 +216,8 @@ export const bybitHostAPIMap: Record<BybitHost, string> = {
 export interface AssetBalance {
   asset: string
   free: string
-  locked: string
+  /** Absent when the venue reports no hold figure (Kraken spot v2). */
+  locked?: string
   /**
    * The venue's OWN figure for how much of this asset is currently spendable,
    * when it publishes one. Optional and additive: every producer that has no
@@ -273,12 +289,22 @@ export interface ExecutionReport {
   totalTradeQuantity: string // Cumulative filled quantity
   uniqueMessageId?: string
   liquidation?: boolean
+  feePaid?: string
+  feeAsset?: string
+  /**
+   * WHICH side of the pair the fee came out of. Only paper-trading sets this
+   * today — it always knows the side deterministically and never sets
+   * `feeAsset` (spec 003) — but it lives on the shared `ExecutionReport`
+   * shape, not a paper-only type, the same way `feeAsset` does for every
+   * real venue.
+   */
+  feeSide?: 'base' | 'quote'
+  feeBreakdown?: { asset: string; amount: string }[]
+  feePaidUsd?: string
 }
 
 export type UserDataStreamEvent =
-  | OutboundAccountPosition
-  | ExecutionReport
-  | BalanceUpdate
+  OutboundAccountPosition | ExecutionReport | BalanceUpdate
 
 export enum CoinbaseKeysType {
   legacy = 'legacy',
@@ -395,6 +421,39 @@ type BitgetSpotOrder = {
   enterPointSource: string
 }
 
+/** A Unified Trading Account (v3) `order` push — one shape for every category. */
+type BitgetUtaOrder = {
+  category: string
+  symbol: string
+  orderId: string
+  clientOid: string
+  price: string
+  qty: string
+  orderType: string
+  side: string
+  cumExecQty: string
+  cumExecValue: string
+  avgPrice: string
+  orderStatus: string
+  feeDetail?: { feeCoin: string; fee: string }[]
+  createdTime: string
+  updatedTime: string
+}
+
+/** A Unified Trading Account (v3) `account` push. */
+type BitgetUtaAccount = {
+  totalEquity?: string
+  unrealisedPnL?: string
+  coin?: {
+    coin: string
+    equity?: string
+    usdValue?: string
+    balance: string
+    available: string
+    locked?: string
+  }[]
+}
+
 type BitgetSpotBalance = {
   coin: string
   available: string
@@ -429,6 +488,15 @@ export type PaperOrderMessage = {
   side: string
   quoteAmount: number
   exchange: string
+  // Reported by paper-trading's UserGateway.sendOrderToClient since spec 003
+  // (`paperOrderFee`) — absent means no fee was charged, never a claim of
+  // zero (mirrors every real venue's convention).
+  feePaid?: string
+  feeSide?: 'base' | 'quote'
+  // A symbol configured for third-asset fee testing (paper-trading spec
+  // 004) reports this instead of `feeSide` — never both, same as a real
+  // venue's `feeAsset`/`feeSide` (spec 006).
+  feeAsset?: string
 }
 
 export type OKXAccountMsg = {
@@ -603,6 +671,59 @@ const krakenFillTotals = new ExpirableMap<
   { qty: number; cost: number; fillIds: Set<string> }
 >(60 * 60 * 1000)
 
+/**
+ * One `fills` message can carry a whole batch, and Kraken delivers it
+ * NEWEST-FIRST. The accumulator above only produces the CUMULATIVE executed
+ * quantity if it sums the batch in the order the chunks actually executed, so
+ * the batch is ordered before it is mapped (spec 009 §4.1).
+ *
+ * Mapping in delivery order put the chunk that closed the order first, so the
+ * relay emitted FILLED carrying the SMALLEST running total and the true totals
+ * behind it as PARTIALLY_FILLED — which app-sh discards as `already processed`.
+ *
+ * `seq` is the tiebreak, not the primary key: the chunks of one taker fill
+ * commonly share a millisecond, but `seq` is a per-connection counter that
+ * resets across reconnects. Missing values compare equal and `sort` is stable,
+ * so a batch Kraken gave us no ordering for keeps its delivery order. Returns
+ * a copy — the caller's message is not ours to reorder.
+ */
+const chronologicalKrakenFills = <T extends { time?: number; seq?: number }>(
+  fills: T[],
+): T[] =>
+  [...fills].sort(
+    (a, b) => (a.time || 0) - (b.time || 0) || (a.seq || 0) - (b.seq || 0),
+  )
+
+// Running per-order fee totals for Kraken spot, keyed by exchange order id.
+// The v2 `executions` channel's `fees[]` is treated as per-fill (spec 003
+// §2.1/§3.1 — the docs don't say whether it accumulates, so under-forwarding
+// is the conservative default), so it's summed here the same way
+// `krakenFillTotals` sums futures fill quantity — deduped by `exec_id` so a
+// redelivered event cannot double-count. `fee_usd_equiv` is NOT summed here:
+// it's documented as already an order-level running total and is forwarded
+// as-is at the call site.
+const krakenSpotFeeTotals = new ExpirableMap<
+  string,
+  { amounts: Record<string, number>; execIds: Set<string> }
+>(60 * 60 * 1000)
+
+// Last known symbol per Kraken spot order, keyed by exchange order id.
+// Kraken's v2 `executions` channel only names the pair on the DETAIL frames
+// (`pending_new`, `trade`, and the snapshot). The summary frames that announce
+// the terminal state — `exec_type` `filled`/`canceled`/`amended` — carry ids
+// and totals only, so without this the report that books the fill went out
+// with `symbol: ''`; app-sh then missed `getExchangeInfo` and priced the fill
+// through MathHelper.round's 2-decimal default (spec 007 §1.2b).
+// TTL is 24h rather than the 1h its two neighbours above use: those track a
+// fill/fee run, this has to outlive an order RESTING on the book — a GTC grid
+// order cancelled hours after placement never sends a second symbol-bearing
+// frame. One short string per entry, self-evicting.
+const KRAKEN_SPOT_SYMBOL_TTL_MS =
+  Number(process.env.KRAKEN_SPOT_SYMBOL_TTL_MS) || 24 * 60 * 60 * 1000
+const krakenSpotOrderSymbols = new ExpirableMap<string, string>(
+  KRAKEN_SPOT_SYMBOL_TTL_MS,
+)
+
 // Park-and-retry for the HL two-channel fill join (see hyperliquidFillPark.ts).
 // Grace window: how long a FILLED orderUpdate waits for its `userFills` to
 // arrive before falling back to a REST lookup. Size cap bounds the map.
@@ -681,6 +802,12 @@ class UserConnector {
    *  whether a new rejection continues the current strike run or starts a
    *  fresh one. */
   private authLastRejectAt: Map<string, number> = new Map()
+  /** Room id → sha1 fingerprint of the credential that armed the cooldown.
+   *  Bot-driven rooms are keyed by the account uuid, which SURVIVES a key
+   *  swap — so without this, a user who fixes their rejected key would still
+   *  wait out a cooldown earned by the old one (up to 24h). The gate compares
+   *  fingerprints and lets a changed credential through immediately. */
+  private authCooldownCredFp: Map<string, string> = new Map()
   /** Pending self-heal retry timer per room id. Tracked so a room that is
    *  torn down while circuit-broken (the user deleted the connection) can
    *  have its retry cancelled — otherwise the timer resurrects a stream for a
@@ -1336,7 +1463,12 @@ class UserConnector {
    * rejected. A room that streamed fine for longer than that and only now
    * rejects (key revoked later) starts the ladder over at the base cooldown.
    */
-  private armAuthCooldown(id: string, userId?: string, now = Date.now()) {
+  private armAuthCooldown(
+    id: string,
+    userId?: string,
+    now = Date.now(),
+    credFp?: string,
+  ) {
     const prevStrikes = this.authCooldownStrikes.get(id) ?? 0
     const lastReject = this.authLastRejectAt.get(id) ?? 0
     const consecutive =
@@ -1347,9 +1479,34 @@ class UserConnector {
     this.authCooldownStrikes.set(id, strikes + 1)
     this.authLastRejectAt.set(id, now)
     this.authCooldownUntil.set(id, now + cooldownMs)
+    if (credFp) {
+      this.authCooldownCredFp.set(id, credFp)
+    }
     // New cooldown period ⇒ new skip log allowed.
     this.releaseAuthCooldownLogLatch(id, userId)
     return { cooldownMs, strikes: strikes + 1 }
+  }
+
+  /** Fingerprint of the credential material a subscribe request carries.
+   *  Compared against `authCooldownCredFp` by the cooldown gate.
+   *
+   *  Whitespace is stripped before hashing: the binance branch MUTATES
+   *  `api.secret` in place (PRIVATE-KEY space→newline normalization) before
+   *  the exception handler arms the breaker, while the gate sees the raw
+   *  secret of the NEXT request — with whitespace significant, the armed
+   *  fingerprint never matched and the "credentials changed" bypass re-lifted
+   *  the cooldown on every re-request, turning a circuit-broken -1193 room
+   *  into a ~1/sec reject loop (observed live on the 2026-08-30 deploy). */
+  private credFingerprint(api: OpenStreamInput['api']) {
+    const strip = (v?: string) => (v ?? '').replace(/\s+/g, '')
+    return crypto
+      .createHash('sha1')
+      .update(
+        `${strip(api.key)}|${strip(api.secret)}|${strip(api.passphrase)}|${
+          api.keysType ?? ''
+        }`,
+      )
+      .digest('hex')
   }
 
   /**
@@ -1389,12 +1546,25 @@ class UserConnector {
     exchange: ExchangeEnum,
     userId: string | undefined,
     reason: string,
+    exchangeUUID?: string,
+    kind: 'authReject' | 'legacyKey' = 'authReject',
   ) {
     try {
       this.redis?.publish(
         serviceLogRedis,
         JSON.stringify({
-          userStreamAuthReject: { exchange, userId, reason },
+          // `exchangeUUID` is the room id — for bot-driven rooms that is the
+          // account uuid, which is what main-app persists so the admin
+          // user-stream-health page and the fill-failsafe escalation know
+          // WHICH account is auth-dead (and why: kind 'legacyKey' means the
+          // key type can never stream and self-healing is pointless).
+          userStreamAuthReject: {
+            exchange,
+            userId,
+            reason,
+            exchangeUUID,
+            kind,
+          },
         }),
       )
     } catch {
@@ -1429,6 +1599,7 @@ class UserConnector {
       this.authCooldownUntil.delete(id)
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
       this.authCooldownSkipsSuppressed.delete(id)
       this.transportFailures.delete(id)
       this.transportStrikes.delete(id)
@@ -1503,10 +1674,11 @@ class UserConnector {
   }
 
   @IdMute(mutex, () => `closeStreamBitget`)
-  private async closeBitgetConnection(client: BitgetClient) {
+  private async closeBitgetConnection(client: BitgetClient | BitgetUtaClient) {
     client.closeAll(true)
-    client.on('exception', () => null)
-    client.on('update', () => null)
+    const events = client as unknown as EventEmitter
+    events.on('exception', () => null)
+    events.on('update', () => null)
   }
   /**
    * User-stream flap detector. A single reconnect is healthy auto-recovery;
@@ -1644,7 +1816,25 @@ class UserConnector {
     // regenerated key hashes to a different `id`, so this only gates the exact
     // rejected credential and never blocks a fixed key.
     const cooldownUntil = this.authCooldownUntil.get(id) ?? 0
-    if (cooldownUntil > Date.now()) {
+    const armedCredFp = this.authCooldownCredFp.get(id)
+    if (
+      cooldownUntil > Date.now() &&
+      armedCredFp &&
+      armedCredFp !== this.credFingerprint(api)
+    ) {
+      // The request carries a DIFFERENT credential than the one that was
+      // rejected — the user replaced the key under the same account uuid.
+      // Waiting out a cooldown the old key earned would block the fix for up
+      // to 24h; drop the breaker and let the new key prove itself.
+      this.authCooldownUntil.delete(id)
+      this.authCooldownStrikes.delete(id)
+      this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
+      this.releaseAuthCooldownLogLatch(id, userId)
+      this.logger(
+        `Auth-rejection cooldown for ${userId} (room ${id}) lifted: credentials changed since the rejection`,
+      )
+    } else if (cooldownUntil > Date.now()) {
       // Log once per cooldown period, at info: the skip is the breaker working
       // as designed, not a service error, and the callers re-ask ~5x/min.
       const suppressed = this.authCooldownSkipsSuppressed.get(id)
@@ -1658,16 +1848,18 @@ class UserConnector {
       }
       this.authCooldownSkipsSuppressed.set(id, suppressed + 1)
       return
+    } else {
+      // Cooldown lapsed (or was never armed): drop the latch so the next
+      // cooldown logs again, and report what the latch swallowed. Also drop
+      // the lapsed gate entry itself — the self-heal timer used to be the only
+      // thing that cleared it, and it no longer runs for every cooldown (a
+      // torn-down room has its retry cancelled).
+      if (cooldownUntil) {
+        this.authCooldownUntil.delete(id)
+        this.authCooldownCredFp.delete(id)
+      }
+      this.releaseAuthCooldownLogLatch(id, userId)
     }
-    // Cooldown lapsed (or was never armed): drop the latch so the next cooldown
-    // logs again, and report what the latch swallowed. Also drop the lapsed
-    // gate entry itself — the self-heal timer used to be the only thing that
-    // cleared it, and it no longer runs for every cooldown (a torn-down room
-    // has its retry cancelled).
-    if (cooldownUntil) {
-      this.authCooldownUntil.delete(id)
-    }
-    this.releaseAuthCooldownLogLatch(id, userId)
     let findUser = this.users.find((user) => user.id === id)
     if (!findUser) {
       findUser = {
@@ -1709,6 +1901,39 @@ class UserConnector {
           api.provider === ExchangeEnum.binance &&
           api.secret.includes('PRIVATE KEY') &&
           !api.secret.includes('RSA PRIVATE KEY')
+        if (!useWebsocketAPI && api.provider === ExchangeEnum.binance) {
+          // Binance spot dropped the legacy listenKey user stream: an HMAC or
+          // RSA key can NEVER subscribe, so the old throw-per-attempt here was
+          // pure churn — 123 accounts retrying every few minutes (~3.5k error
+          // lines in 100min on 2026-08-30), every fill on them detected only
+          // by the reconcile sweep, and no user-facing signal from this path.
+          // Treat it exactly like a -1193/-2015 auth reject: arm the
+          // escalating circuit-breaker (30min → 24h), tell the user the
+          // precise fix, and let the cooldown gate absorb the re-requests. A
+          // key replaced under the same account uuid bypasses the gate via
+          // the credential fingerprint, so the fix takes effect immediately.
+          const { cooldownMs, strikes } = this.armAuthCooldown(
+            id,
+            userId,
+            Date.now(),
+            this.credFingerprint(api),
+          )
+          this.publishAuthRejectNotice(
+            api.provider,
+            userId,
+            'Binance spot realtime updates require an Ed25519 API key. Create an Ed25519 key on Binance and update this exchange connection in Gainium — until then, order fills are detected with a delay.',
+            id,
+            'legacyKey',
+          )
+          findUser = { ...findUser, pending: false }
+          this.saveUser(findUser)
+          return this.logger(
+            `${id} ${userId} Binance spot key is legacy (HMAC/RSA) — user stream unsupported; circuit-broken for ${Math.round(
+              cooldownMs / 1000,
+            )}s (strike ${strikes}), user notified ${api.provider}`,
+            true,
+          )
+        }
         /** New exchange instance */
         let client: WebsocketClient
         let startMethod: () => Promise<void> = async () => {
@@ -1746,32 +1971,47 @@ class UserConnector {
             '-----BEGIN PRIVATE KEY-----\n',
           )
           .replace(/ -----END PRIVATE KEY-----/g, '\n-----END PRIVATE KEY-----')
+        // `withLosslessOrderIds` on every Binance client below: the vendor SDK
+        // parses each frame with a bare `JSON.parse`, which rounds a >2^53 order
+        // id to the nearest double before any of our code sees it — 19-digit USDM
+        // ids arrived with their low digits replaced by zeros, so different orders
+        // shared one id. See specs/004.
         if (api.provider === ExchangeEnum.binanceUS) {
           client = new WebsocketClient(
-            {
+            withLosslessOrderIds({
               api_key: api.key,
               api_secret: api.secret,
               restOptions: {
                 baseUrl: 'https://api.binance.us',
               },
               wsUrl: 'wss://stream.binance.us:9443/ws',
-            },
+            }),
             wsLoggerOptions,
           )
         } else {
           if (useWebsocketAPI) {
-            const wsAPI = new WebsocketAPIClient(
+            const wsApiStream = createBinanceWsApiUserStream(
               {
                 api_key: api.key,
                 api_secret: api.secret,
               },
               wsLoggerOptions,
+              () => {
+                // The reconcile signal for a reconnect, sent only once the
+                // SDK's resubscribe is accepted — see the `reconnected`
+                // handler below for why it is not sent there on this path.
+                this.logger(
+                  `${id} user data stream resubscribed ${api.provider}`,
+                )
+                this.redis?.publish(
+                  `userStreamInfo${id}`,
+                  `Subscribed to user ${id}`,
+                )
+              },
             )
 
-            client = wsAPI.getWSClient()
-            startMethod = async () => {
-              await wsAPI.subscribeUserDataStream('mainWSAPI')
-            }
+            client = wsApiStream.client
+            startMethod = wsApiStream.start
             stopMethod = async () => {
               //@ts-ignore
               client.respawnUserDataStream = (...args: unknown[]) =>
@@ -1788,32 +2028,28 @@ class UserConnector {
               // and raised `stream_flap` (bug #433). Closing the connection IS
               // the unsubscribe here: a WS-API user data stream is bound to its
               // connection, and `close()` marks the socket CLOSING so the SDK
-              // neither reconnects nor resubscribes.
-              client.closeAll(false)
+              // neither reconnects nor resubscribes. `stop()` also no-ops a
+              // resubscribe the SDK queued before the teardown, which would
+              // otherwise re-open that socket.
+              wsApiStream.stop()
             }
           } else {
             client = new WebsocketClient(
-              {
+              withLosslessOrderIds({
                 api_key: api.key,
                 api_secret: api.secret,
-              },
+              }),
               wsLoggerOptions,
             )
           }
         }
-        if (!useWebsocketAPI && api.provider === ExchangeEnum.binance) {
-          startMethod = async () => {
-            throw new Error(
-              `Support of legacy subscribed is dropped for binance, please use websocket API key to avoid connection issues`,
-            )
-          }
-        }
+        // (Legacy HMAC/RSA binance-spot keys never get here — they are
+        // circuit-broken above, before a client is even constructed.)
 
-        client.removeAllListeners('open')
-        client.removeAllListeners('reconnecting')
-        client.removeAllListeners('reconnected')
-        client.removeAllListeners('authenticated')
-        client.removeAllListeners('exception')
+        // Never `removeAllListeners` on this client: it is brand new, so the
+        // only listeners it can have are the SDK's own, and the WS-API client's
+        // `reconnected` listener is the one that resubscribes the user data
+        // stream after a reconnect (spec 008).
         client.on('message', (data: any) => {
           if (
             [ExchangeEnum.binance, ExchangeEnum.binanceUS].includes(
@@ -1842,6 +2078,18 @@ class UserConnector {
         }) // receive notification that a reconnection completed successfully (e.g use REST to check for missing data)
         client.on('reconnected', (data) => {
           this.logger(`${id} ws has reconnected ${data.wsKey}  ${api.provider}`)
+          // Same reconcile signal bybit/bitget publish, and for the same
+          // reason: a reconnect means we may have missed an executionReport
+          // while the socket was down, and only the bots can find out. Scoped
+          // to this one account's room. On the WS-API path the stream is not
+          // back yet at this point — the SDK resubscribes ~2s later — so that
+          // path publishes from its `onResubscribed` callback instead.
+          if (!useWebsocketAPI) {
+            this.redis?.publish(
+              `userStreamInfo${id}`,
+              `Subscribed to user ${id}`,
+            )
+          }
           this.noteReconnect(id, api.provider)
         })
         client.on('close', (data) => {
@@ -1919,6 +2167,7 @@ class UserConnector {
               id,
               userId,
               now,
+              this.credFingerprint(api),
             )
             this.binanceAuthErrors.delete(id)
             this.binanceErrors.delete(id)
@@ -1939,6 +2188,7 @@ class UserConnector {
               api.provider,
               userId,
               isFatalAuthReject ? authMsg : `code ${authCode || 401}`,
+              id,
             )
             // One delayed retry after the cooldown so a key fixed in place
             // (e.g. egress IP added to the whitelist without regenerating the
@@ -2778,104 +3028,151 @@ class UserConnector {
       ) {
         /** Open stream and set callback  */
         try {
-          /** New exchange instance */
-          const client = new BitgetClient(
-            {
-              apiKey: api.key,
-              apiPass: api.passphrase,
-              apiSecret: api.secret,
-            },
-            {
-              silly: () => null,
-              // Unlike the `msg?.[0]` adapters below, these two serialize every
-              // argument — including the `{ wsMessage, wsKey, exception }`
-              // context the SDK passes on a send failure. Bitget does not call
-              // these levels today, but the shape is the one that leaks, so
-              // redact rather than rely on that staying true across a bump.
-              debug: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget debug log ${safeStringify({
-                    msg,
-                  })} ${api.provider}`,
-                ),
-              notice: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget notice log ${safeStringify({
-                    msg,
-                  })} ${api.provider}`,
-                ),
-              info: (...msg) => {
-                if (msg[0] === 'Websocket reconnected') {
-                  this.redis?.publish(
-                    `userStreamInfo${id}`,
-                    `Subscribed to user ${id}`,
-                  )
-                }
-                this.logger(
-                  `${id} ${userId} bitget info log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
+          // A Unified Trading Account publishes its orders and balances only
+          // on the v3 private socket; the v2 channels stay silent for it.
+          const accountMode = await this.bitgetAccountMode(api)
+          const credentials = {
+            apiKey: api.key,
+            apiPass: api.passphrase,
+            apiSecret: api.secret,
+          }
+          const bitgetLogger = {
+            silly: () => null,
+            // Unlike the `msg?.[0]` adapters below, these two serialize every
+            // argument — including the `{ wsMessage, wsKey, exception }`
+            // context the SDK passes on a send failure. Bitget does not call
+            // these levels today, but the shape is the one that leaks, so
+            // redact rather than rely on that staying true across a bump.
+            debug: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget debug log ${safeStringify({
+                  msg,
+                })} ${api.provider}`,
+              ),
+            notice: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget notice log ${safeStringify({
+                  msg,
+                })} ${api.provider}`,
+              ),
+            info: (...msg: unknown[]) => {
+              if (msg[0] === 'Websocket reconnected') {
+                this.redis?.publish(
+                  `userStreamInfo${id}`,
+                  `Subscribed to user ${id}`,
                 )
-              },
-              warning: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget warning log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
-                ),
-              error: (...msg) =>
-                this.logger(
-                  `${id} ${userId} bitget error log ${JSON.stringify({
-                    msg: msg?.[0],
-                  })} ${api.provider}`,
-                ),
+              }
+              this.logger(
+                `${id} ${userId} bitget info log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              )
             },
-          )
+            warning: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget warning log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              ),
+            error: (...msg: unknown[]) =>
+              this.logger(
+                `${id} ${userId} bitget error log ${JSON.stringify({
+                  msg: msg?.[0],
+                })} ${api.provider}`,
+              ),
+          }
+          const client: BitgetClient | BitgetUtaClient =
+            accountMode === 'uta'
+              ? new BitgetUtaClient(credentials, bitgetLogger)
+              : new BitgetClient(credentials, bitgetLogger)
+          // Both are the same emitter underneath; the lifecycle handlers
+          // below only need `on`/`once`.
+          const events = client as unknown as EventEmitter
           const categories: BitgetInstTypeV2[] =
             api.provider === ExchangeEnum.bitget
               ? ['SPOT']
               : api.provider === ExchangeEnum.bitgetUsdm
                 ? ['USDT-FUTURES', 'USDC-FUTURES']
                 : ['COIN-FUTURES']
-          for (const category of categories) {
-            client.subscribeTopic(category, 'orders', 'default')
+          if (client instanceof BitgetUtaClient) {
+            this.logger(
+              `${id} ${userId} Bitget Unified Trading Account, using the v3 private stream ${api.provider}`,
+            )
+            client.subscribeTopic('order')
             await sleep(100)
-            client.subscribeTopic(category, 'account', 'default')
-            await sleep(100)
-          }
-          client.on('update', (msg) => {
-            if (!categories.includes(msg.arg.instType)) {
-              return
-            }
-            if (
-              (msg.action === 'snapshot' || msg.action === 'update') &&
-              msg.arg.channel === 'orders'
-            ) {
-              const orders = this.prepareBitgetOrderMsg(msg.data)
-              orders.forEach((o) => this.userStreamEvent(id, o))
-            }
-            if (
-              (msg.action === 'snapshot' || msg.action === 'update') &&
-              msg.arg.channel === 'account'
-            ) {
-              const convertedMessage =
-                msg.arg.instType === 'SPOT'
-                  ? this.prepareBitgetSpotOutboundAccountInfo(
-                      msg.data,
+            client.subscribeTopic('account')
+            events.on(
+              'update',
+              (msg: {
+                action?: string
+                arg?: { topic?: string }
+                data: unknown[]
+                ts: number
+              }) => {
+                if (msg.action !== 'snapshot' && msg.action !== 'update') {
+                  return
+                }
+                if (msg.arg?.topic === 'order') {
+                  this.prepareBitgetUtaOrderMsg(
+                    msg.data as BitgetUtaOrder[],
+                    api.provider,
+                  ).forEach((o) => this.userStreamEvent(id, o))
+                }
+                if (msg.arg?.topic === 'account') {
+                  const convertedMessage =
+                    this.prepareBitgetUtaOutboundAccountInfo(
+                      msg.data as BitgetUtaAccount[],
                       msg.ts,
                       uuid || userId,
+                      api.provider,
                     )
-                  : this.prepareBitgetFuturesOutboundAccountInfo(
-                      msg.data,
-                      msg.ts,
-                      uuid || userId,
-                    )
-              if (convertedMessage) {
-                this.userStreamEvent(id, convertedMessage)
+                  if (convertedMessage) {
+                    this.userStreamEvent(id, convertedMessage)
+                  }
+                }
+              },
+            )
+          } else {
+            for (const category of categories) {
+              client.subscribeTopic(category, 'orders', 'default')
+              await sleep(100)
+              client.subscribeTopic(category, 'account', 'default')
+              await sleep(100)
+            }
+            client.on('update', (msg) => {
+              if (!categories.includes(msg.arg.instType)) {
+                return
               }
-            }
-          })
-          client.on('reconnected', () => {
+              if (
+                (msg.action === 'snapshot' || msg.action === 'update') &&
+                msg.arg.channel === 'orders'
+              ) {
+                const orders = this.prepareBitgetOrderMsg(msg.data)
+                orders.forEach((o) => this.userStreamEvent(id, o))
+              }
+              if (
+                (msg.action === 'snapshot' || msg.action === 'update') &&
+                msg.arg.channel === 'account'
+              ) {
+                const convertedMessage =
+                  msg.arg.instType === 'SPOT'
+                    ? this.prepareBitgetSpotOutboundAccountInfo(
+                        msg.data,
+                        msg.ts,
+                        uuid || userId,
+                      )
+                    : this.prepareBitgetFuturesOutboundAccountInfo(
+                        msg.data,
+                        msg.ts,
+                        uuid || userId,
+                      )
+                if (convertedMessage) {
+                  this.userStreamEvent(id, convertedMessage)
+                }
+              }
+            })
+          }
+          events.on('reconnected', () => {
             this.redis?.publish(
               `userStreamInfo${id}`,
               `Subscribed to user ${id}`,
@@ -2885,7 +3182,7 @@ class UserConnector {
           const close = () => {
             this.closeBitgetConnection(client)
           }
-          client.on('exception', async (error: Error | string) => {
+          events.on('exception', async (error: Error | string) => {
             const message = typeof error !== 'string' ? error.message : error
             try {
               this.logger(
@@ -2936,15 +3233,15 @@ class UserConnector {
               )
               reject()
             }, 60 * 1000)
-            client.once('open', () => {
+            events.once('open', () => {
               clearTimeout(timer)
               resolve()
             })
-            client.once('exception', () => {
+            events.once('exception', () => {
               clearTimeout(timer)
               reject()
             })
-            client.once('error', () => {
+            events.once('error', () => {
               clearTimeout(timer)
               reject()
             })
@@ -3170,16 +3467,22 @@ class UserConnector {
           // Subscribe to appropriate topics based on market type
           const wsKey = isFutures ? 'derivativesPrivateV1' : 'spotPrivateV2'
 
+          // ONE array, used for both the log line and the actual subscribe.
+          // They used to be written out twice and had drifted: the log claimed
+          // `["open_orders","balances"]` while the client subscribed to three
+          // feeds including `fills`. Reading prod logs during the Claus #586
+          // investigation that reads as "we never subscribed to fills", which
+          // is wrong — and it is exactly the kind of log a later reader treats
+          // as ground truth.
+          const krakenTopics: Parameters<typeof client.subscribe>[0] = isFutures
+            ? ['open_orders', 'balances', 'fills']
+            : ['executions', 'balances']
+
           this.logger(
-            `${id} Kraken subscribing to topics: ${JSON.stringify(isFutures ? ['open_orders', 'balances'] : ['executions', 'balances'])} on ${wsKey}`,
+            `${id} Kraken subscribing to topics: ${JSON.stringify(krakenTopics)} on ${wsKey}`,
           )
 
-          client.subscribe(
-            isFutures
-              ? ['open_orders', 'balances', 'fills']
-              : ['executions', 'balances'],
-            wsKey,
-          )
+          client.subscribe(krakenTopics, wsKey)
 
           client.on('message', async (msg: any) => {
             const ref = isFutures ? msg.feed : msg.channel
@@ -3223,7 +3526,7 @@ class UserConnector {
                   // Update stored balances
                   const newBalances = new Map<
                     string,
-                    { free: string; locked: string }
+                    { free: string; locked?: string }
                   >()
                   balance.balances.forEach((b) => {
                     newBalances.set(b.asset, { free: b.free, locked: b.locked })
@@ -3253,8 +3556,48 @@ class UserConnector {
             this.logger(`${id} Kraken ws authenticated ${api.provider}`)
           })
 
+          // Per-feed subscribe acknowledgements. The SDK sends ONE subscribe
+          // frame per topic (`getMaxTopicsPerSubscribeEvent()` returns 1), so
+          // Kraken answers each of the three futures feeds separately — but
+          // the venue's failure answer is a bare
+          // `{event:'alert', message:'Failed to subscribe to authenticated
+          // feed'}` with NO feed name, and the `exception` handler below tears
+          // the whole room down on the first one. The result (Claus #586) is
+          // that prod logs cannot say whether Kraken refused every private
+          // feed for that key or only one of them — the distinction between
+          // "this key cannot stream at all" and "we threw away a working
+          // order feed". Logging the acks costs a handful of lines per
+          // connection and settles it from the archived logs next time.
+          client.on('response', (evt: any) => {
+            const feed = evt?.feed ?? evt?.channel
+            const event = evt?.event ?? evt?.method
+            if (!feed || !/^(un)?subscribed?$/i.test(`${event}`)) {
+              return
+            }
+            this.logger(`${id} Kraken ws ${event} feed=${feed} ${api.provider}`)
+          })
+
           client.on('reconnected', () => {
             this.logger(`${id} Kraken ws has reconnected ${api.provider}`)
+            // Tell this account's bots to reconcile, exactly as the bybit and
+            // bitget reconnect handlers already do. Without it the ONLY thing a
+            // reconnect did was bump the flap counter, and any `executions`
+            // message the venue emitted while the socket was down was gone for
+            // good: bots then discovered the fill on the next PROCESS restart,
+            // which in practice meant the nightly one.
+            //
+            // That is how a Kraken ETH/EUR safety order filled at 16:15 UTC on
+            // 2026-08-28 was not booked until 07:52 the next morning — 15h38m
+            // of a deal carrying twice the position the engine thought it held,
+            // with its take-profit priced off the stale average. The socket had
+            // reconnected at 15:53, 21 minutes before the fill.
+            //
+            // Scope is one account (`id` is the exchangeUUID), so this wakes a
+            // handful of bots, not the fleet.
+            this.redis?.publish(
+              `userStreamInfo${id}`,
+              `Subscribed to user ${id}`,
+            )
             this.noteReconnect(id, api.provider)
           })
 
@@ -3263,6 +3606,7 @@ class UserConnector {
             client.removeAllListeners('message')
             client.removeAllListeners('open')
             client.removeAllListeners('authenticated')
+            client.removeAllListeners('response')
             client.removeAllListeners('reconnected')
             client.removeAllListeners('exception')
             // Clean up stored balances
@@ -3347,7 +3691,12 @@ class UserConnector {
             if ((this.authCooldownUntil.get(id) ?? 0) > Date.now()) {
               return
             }
-            const { cooldownMs, strikes } = this.armAuthCooldown(id, userId)
+            const { cooldownMs, strikes } = this.armAuthCooldown(
+              id,
+              userId,
+              Date.now(),
+              this.credFingerprint(api),
+            )
             try {
               close()
             } catch {
@@ -3362,7 +3711,7 @@ class UserConnector {
               )}s (strike ${strikes}) — no reconnect, no flap alert ${api.provider}`,
               true,
             )
-            this.publishAuthRejectNotice(api.provider, userId, errorMsg)
+            this.publishAuthRejectNotice(api.provider, userId, errorMsg, id)
             // One delayed retry so a key fixed in place (e.g. the "WebSocket
             // interface" permission enabled on the same key) self-heals
             // without a bot restart. If it's still rejected, this handler
@@ -3667,6 +4016,11 @@ class UserConnector {
       authOkEvent === 'ACCOUNT_UPDATE' ||
       authOkEvent === 'ACCOUNT_CONFIG_UPDATE'
     ) {
+      // A room that was circuit-broken and now delivers genuine account
+      // events has recovered — tell main-app so it can clear the account's
+      // dead-stream record (admin health page + fill-failsafe escalation).
+      const wasCircuitBroken =
+        this.authCooldownUntil.has(id) || this.authCooldownStrikes.has(id)
       if (this.binanceAuthErrors.has(id)) this.binanceAuthErrors.delete(id)
       if (this.authCooldownUntil.has(id)) this.authCooldownUntil.delete(id)
       // The key is provably authorized ⇒ the strike run is over. A later
@@ -3674,10 +4028,21 @@ class UserConnector {
       // multi-hour backoff earned before the key was fixed.
       this.authCooldownStrikes.delete(id)
       this.authLastRejectAt.delete(id)
+      this.authCooldownCredFp.delete(id)
       // A real account event also proves the transport is up end-to-end.
       this.transportFailures.delete(id)
       this.transportStrikes.delete(id)
       this.releaseAuthCooldownLogLatch(id)
+      if (wasCircuitBroken) {
+        try {
+          this.redis?.publish(
+            serviceLogRedis,
+            JSON.stringify({ userStreamAuthRecovered: { exchangeUUID: id } }),
+          )
+        } catch {
+          /* emit-only */
+        }
+      }
     }
     logger.info(`msg ${streamMsg.uniqueMessageId}`)
 
@@ -3802,6 +4167,8 @@ class UserConnector {
           totalTradeQuantity: data.accFillSz,
           uniqueMessageId: `${data.instId}executionReport${data.uTime}${symbol}${data.state}${data.sz}${data.px}${data.accFillSz}${data.ordType}${data.clOrdId}${data.category}`,
           liquidation: data.category === 'full_liquidation',
+          feePaid: data.fee,
+          feeAsset: data.feeCcy,
         }
       })
   }
@@ -3859,6 +4226,7 @@ class UserConnector {
               uniqueMessageId: `${Object.entries(order)
                 .map(([k, v]) => `${k}:${v}`)
                 .join(',')}`,
+              feePaid: order.total_fees,
             }
           }),
       )
@@ -3911,45 +4279,77 @@ class UserConnector {
           category === 'inverse' ? data.cumExecValue : data.cumExecQty,
         uniqueMessageId: `${data.category}executionReport${data.updatedTime}${data.symbol}${data.orderStatus}${data.qty}${data.price}${data.cumExecQty}${data.orderType}${data.orderLinkId}${data.createType}`,
         liquidation: data.createType === 'CreateByTakeOver_PassThrough',
+        // Both fields are marked DEPRECATED by Bybit for linear/spot in
+        // favor of `cumFeeDetail`/per-fill `execFee` (spec 003 §3.2) — still
+        // populated today, but this is a follow-up: capture `cumFeeDetail`'s
+        // shape and migrate before Bybit stops filling the old fields.
+        feePaid: data.cumExecFee,
+        feeAsset: data.feeCurrency,
       }))
   }
 
   private prepareBitgetOrderMsg(msg: BitgetSpotOrder[]): ExecutionReport[] {
-    return msg.map((data) => ({
-      creationTime: parseInt(data.cTime),
-      eventTime: parseInt(data.uTime),
-      eventType: 'executionReport',
-      newClientOrderId: data.clientOid,
-      orderId: data.orderId,
-      orderTime: parseInt(data.uTime),
-      orderStatus: (() => {
-        const { status } = data
-        if (['live'].includes(status)) {
-          return 'NEW'
-        }
-        if (status === 'partially_filled') {
-          return 'PARTIALLY_FILLED'
-        }
-        if (status === 'filled') {
-          return 'FILLED'
-        }
-        return 'CANCELED'
-      })(),
-      orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
-      originalClientOrderId: data.clientOid,
-      price: `${+data.priceAvg || +data.price}`,
-      quantity: data.baseVolume,
-      side: data.side === 'buy' ? 'BUY' : 'SELL',
-      symbol: data.instId,
-      totalQuoteTradeQuantity:
-        +data.accBaseVolume && +data.priceAvg
-          ? `${+data.accBaseVolume * +data.priceAvg}`
-          : '0',
-      totalTradeQuantity: data.accBaseVolume,
-      uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
-        .map(([k, v]) => `${k}:${v}`)
-        .join(',')}`,
-    }))
+    return msg.map((data) => {
+      // Every other venue's normalizer emits feePaid/feeAsset as a single
+      // value alongside whatever else it carries — Bitget was the one
+      // exception, feeBreakdown only. feeBreakdown stays (a genuine
+      // multi-leg fee is real, per §3.2 — a fee-currency-balance-exhausted
+      // fill can charge two currencies at once), but a consumer that only
+      // reads feePaid/feeAsset (the single-value shape every other venue
+      // guarantees) still gets a value. When feeDetail has more than one
+      // leg, prefer whichever one is base- or quote-denominated — the
+      // instId is BASEQUOTE with no separator, so match on prefix/suffix —
+      // over a third-asset leg, falling back to the first leg reported when
+      // nothing matches either side.
+      const primaryFeeLeg = data.feeDetail?.length
+        ? (data.feeDetail.find(
+            (d) =>
+              data.instId.startsWith(d.feeCoin) ||
+              data.instId.endsWith(d.feeCoin),
+          ) ?? data.feeDetail[0])
+        : undefined
+      return {
+        creationTime: parseInt(data.cTime),
+        eventTime: parseInt(data.uTime),
+        eventType: 'executionReport',
+        newClientOrderId: data.clientOid,
+        orderId: data.orderId,
+        orderTime: parseInt(data.uTime),
+        orderStatus: (() => {
+          const { status } = data
+          if (['live'].includes(status)) {
+            return 'NEW'
+          }
+          if (status === 'partially_filled') {
+            return 'PARTIALLY_FILLED'
+          }
+          if (status === 'filled') {
+            return 'FILLED'
+          }
+          return 'CANCELED'
+        })(),
+        orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
+        originalClientOrderId: data.clientOid,
+        price: `${+data.priceAvg || +data.price}`,
+        quantity: data.baseVolume,
+        side: data.side === 'buy' ? 'BUY' : 'SELL',
+        symbol: data.instId,
+        totalQuoteTradeQuantity:
+          +data.accBaseVolume && +data.priceAvg
+            ? `${+data.accBaseVolume * +data.priceAvg}`
+            : '0',
+        totalTradeQuantity: data.accBaseVolume,
+        uniqueMessageId: `BitgetexecutionReport${Object.entries(data)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(',')}`,
+        feeBreakdown: data.feeDetail?.map((d) => ({
+          asset: d.feeCoin,
+          amount: d.fee,
+        })),
+        feePaid: primaryFeeLeg?.fee,
+        feeAsset: primaryFeeLeg?.feeCoin,
+      }
+    })
   }
 
   private preparePaperOrderMsg(msg: PaperOrderMessage): ExecutionReport {
@@ -3970,6 +4370,11 @@ class UserConnector {
       totalQuoteTradeQuantity: `${msg.filledQuoteAmount}`,
       totalTradeQuantity: `${msg.filledAmount}`,
       uniqueMessageId: `executionReport${msg.updatedAt}${msg.symbol}${msg.status}${msg.amount}${msg.price}${msg.externalId}`,
+      // Absent means "no fee observed", never a claim of zero (spec 003) —
+      // only forward what paper-trading actually reported.
+      ...(msg.feePaid !== undefined ? { feePaid: msg.feePaid } : {}),
+      ...(msg.feeSide !== undefined ? { feeSide: msg.feeSide } : {}),
+      ...(msg.feeAsset !== undefined ? { feeAsset: msg.feeAsset } : {}),
       liquidation: msg.externalId.startsWith('liquidation_'),
     }
   }
@@ -4002,6 +4407,15 @@ class UserConnector {
         price = `${(filledSize ? quote / filledSize : +order.order.limitPx).toFixed(pricePrecision)}`
       }
     }
+    // fee/feeToken are per-fill (spec 003 §2.1) — sum across the same buffered
+    // fills used for filledSize/quote above, not a separate accumulator.
+    const feePaid = get ? `${get.reduce((a, c) => a + +c.fee, 0)}` : undefined
+    // HL's raw token name (UAVAX) → the ticker the pair uses (AVAX); main-app
+    // matches fees to the pair by name, and an unmatched one is booked as a
+    // third-asset fee, which leaves it out of the TP size.
+    const feeAsset = get
+      ? aliasHyperliquidToken(get[get.length - 1].feeToken)
+      : undefined
     if (
       isFilled &&
       (filledSize < +order.order.origSz || filledSize > +order.order.origSz)
@@ -4034,6 +4448,8 @@ class UserConnector {
       totalTradeQuantity: `${filledSize}`,
       uniqueMessageId: `executionReport${JSON.stringify(order)},fills:${JSON.stringify(get || [])}`,
       liquidation: false,
+      feePaid,
+      feeAsset,
     }
   }
 
@@ -4117,6 +4533,13 @@ class UserConnector {
     ctx: { roomId: string; user: string; exchange: ExchangeEnum; key: string },
   ): Promise<(UserDataStreamEvent & { uniqueMessageId?: string })[]> {
     const out: (UserDataStreamEvent & { uniqueMessageId?: string })[] = []
+    // The fee token alias needs spotMeta. Block only until the first load;
+    // after that, refreshes run in the background.
+    const hlSymbols = HyperliquidSymbolMap.getInstance()
+    const spotTokens = hlSymbols.ensureSpotTokens()
+    if (!hlSymbols.hasSpotTokens()) {
+      await spotTokens
+    }
     for (const order of data) {
       if (!order.order.cloid) {
         continue
@@ -4237,6 +4660,159 @@ class UserConnector {
     }
   }
 
+  /**
+   * Bitget Classic vs Unified Trading Account for this key, asked a few times
+   * before giving up: an undetermined key falls back to the classic stream,
+   * which for a unified account would publish nothing at all.
+   */
+  private async bitgetAccountMode(api: {
+    key: string
+    secret: string
+    passphrase?: string
+  }): Promise<BitgetAccountMode> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const mode = await detectBitgetAccountMode(api)
+      if (mode) {
+        return mode
+      }
+      await sleep(2000)
+    }
+    this.logger(
+      'Bitget account mode undetermined after 3 attempts, using the classic stream',
+      true,
+    )
+    return 'classic'
+  }
+
+  private prepareBitgetUtaOrderMsg(
+    msg: BitgetUtaOrder[],
+    provider: ExchangeEnum,
+  ): ExecutionReport[] {
+    // One unified socket carries every category; a connection only reports
+    // the ones its exchange trades.
+    const categories =
+      provider === ExchangeEnum.bitget
+        ? ['spot']
+        : provider === ExchangeEnum.bitgetCoinm
+          ? ['coin-futures']
+          : ['usdt-futures', 'usdc-futures']
+    const inverse = provider === ExchangeEnum.bitgetCoinm
+    return (msg ?? [])
+      .filter((data) =>
+        categories.includes(`${data.category ?? ''}`.toLowerCase()),
+      )
+      .map((data) => {
+        const primaryFeeLeg = data.feeDetail?.length
+          ? (data.feeDetail.find(
+              (d) =>
+                data.symbol.startsWith(d.feeCoin) ||
+                data.symbol.endsWith(d.feeCoin),
+            ) ?? data.feeDetail[0])
+          : undefined
+        // An inverse perpetual is named `BTCUSD_CM` on the unified line and
+        // sized there in 1-USD contracts, while the platform knows it as
+        // `BTCUSD` and holds it in the base coin (exchange-connector spec
+        // 014 §3.2/§3.4).
+        const price = +data.avgPrice || +data.price
+        const contracts =
+          inverse && price > 0 && bitgetInverseQtyUnit(data) === 'quote'
+        const filled = contracts
+          ? `${+data.cumExecQty / price}`
+          : data.cumExecQty
+        return {
+          creationTime: parseInt(data.createdTime),
+          eventTime: parseInt(data.updatedTime),
+          eventType: 'executionReport',
+          newClientOrderId: data.clientOid,
+          orderId: data.orderId,
+          orderTime: parseInt(data.updatedTime),
+          orderStatus:
+            data.orderStatus === 'live' || data.orderStatus === 'new'
+              ? 'NEW'
+              : data.orderStatus === 'partially_filled'
+                ? 'PARTIALLY_FILLED'
+                : data.orderStatus === 'filled'
+                  ? 'FILLED'
+                  : 'CANCELED',
+          orderType: data.orderType === 'limit' ? 'LIMIT' : 'MARKET',
+          originalClientOrderId: data.clientOid,
+          price: `${+data.avgPrice || +data.price}`,
+          // Filled base quantity, as the classic mapper reports it — `qty` is
+          // the quote amount on a spot market buy.
+          quantity: filled,
+          side: data.side === 'buy' ? 'BUY' : 'SELL',
+          symbol: inverse
+            ? bitgetInversePlatformSymbol(data.symbol)
+            : data.symbol,
+          totalQuoteTradeQuantity: contracts
+            ? data.cumExecQty
+            : data.cumExecValue || '0',
+          totalTradeQuantity: filled,
+          uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
+          feeBreakdown: data.feeDetail?.map((d) => ({
+            asset: d.feeCoin,
+            amount: d.fee,
+          })),
+          feePaid: primaryFeeLeg?.fee,
+          feeAsset: primaryFeeLeg?.feeCoin,
+        } as ExecutionReport
+      })
+  }
+
+  private prepareBitgetUtaOutboundAccountInfo(
+    msg: BitgetUtaAccount[],
+    time: number,
+    userId: string,
+    provider: ExchangeEnum,
+  ): OutboundAccountPosition | undefined {
+    const coins = (msg ?? []).flatMap((m) => m.coin ?? [])
+    // `free + locked` is the coin's total; whatever is not available is
+    // held by open orders or position margin. The per-coin figures leave out
+    // what resting orders and positions hold (`balance` and `equity` both
+    // shrink as a ladder is placed), so the account's USD `totalEquity`, less
+    // open P&L, over the coins' `usdValue` is held funds. They go to the one
+    // coin that can hold them, at its own price; with several candidates the
+    // coin figures stand (exchange-connector-sh spec 030, same as REST).
+    const kept = coins.filter(
+      (c) =>
+        provider === ExchangeEnum.bitget ||
+        // Inverse contracts are margined in the coin they are written on,
+        // a different coin per pair.
+        provider === ExchangeEnum.bitgetCoinm ||
+        c.coin === 'USDT' ||
+        c.coin === 'USDC',
+    )
+    const priced = kept.filter((c) => +c.balance > 0 && +(c.usdValue ?? 0) > 0)
+    const heldUsd = (msg ?? []).reduce(
+      (sum, m) =>
+        sum + (+(m.totalEquity ?? 0) || 0) - (+(m.unrealisedPnL ?? 0) || 0),
+      -coins.reduce((sum, c) => sum + (+(c.usdValue ?? 0) || 0), 0),
+    )
+    // `totalEquity` is rounded to cents; below that it is rounding, not funds.
+    const holder = heldUsd > 0.01 && priced.length === 1 ? priced[0] : null
+    const balances = kept.map((c) => {
+      const held =
+        c === holder ? (heldUsd * +c.balance) / +(c.usdValue ?? 0) : 0
+      const balance = (+c.balance || 0) + held
+      const free = Math.min(Math.max(+c.available || 0, 0), balance)
+      return {
+        asset: c.coin,
+        free: `${free}`,
+        locked: `${balance - free}`,
+      }
+    })
+    if (!balances.length) {
+      return undefined
+    }
+    return {
+      balances,
+      eventTime: time,
+      eventType: 'outboundAccountPosition',
+      lastAccountUpdate: 0,
+      uniqueMessageId: `outboundAccountPosition${userId}${JSON.stringify(balances)}bitgetUta`,
+    }
+  }
+
   private prepareBitgetFuturesOutboundAccountInfo(
     msg: BitgetFuturesBalance[],
     time: number,
@@ -4308,9 +4884,65 @@ class UserConnector {
 
     // Kraken spot executions format - has data array
     if (channel === 'executions' && msg.data && Array.isArray(msg.data)) {
+      // Learn every symbol this frame states BEFORE mapping any of it, so a
+      // frame that batches an order's detail and its terminal summary resolves
+      // whichever order they arrive in (spec 007 §5.3). Across frames the map
+      // does the same job over time: the detail frames come first for 90 of
+      // the 96 orders that produce both.
+      for (const entry of msg.data) {
+        const key = `${entry.order_id || entry.cl_ord_id || ''}`
+        if (key && entry.symbol) {
+          krakenSpotOrderSymbols.set(
+            key,
+            maps.wsnameToNormalized.get(entry.symbol) || entry.symbol,
+          )
+        }
+      }
       return msg.data.map((order: any) => {
-        const symbol =
-          maps.wsnameToNormalized.get(order.symbol) || order.symbol || ''
+        const orderKey = `${order.order_id || order.cl_ord_id || ''}`
+        // A frame that names no pair inherits the one we last saw for this
+        // order; `''` only when the order is genuinely unknown to us.
+        const symbol = order.symbol
+          ? maps.wsnameToNormalized.get(order.symbol) || order.symbol
+          : (orderKey && krakenSpotOrderSymbols.get(orderKey)) || ''
+
+        const execId = `${order.exec_id ?? ''}`
+        const feeTotals = krakenSpotFeeTotals.get(orderKey) ?? {
+          amounts: {} as Record<string, number>,
+          execIds: new Set<string>(),
+        }
+        if (
+          execId &&
+          !feeTotals.execIds.has(execId) &&
+          Array.isArray(order.fees)
+        ) {
+          feeTotals.execIds.add(execId)
+          for (const leg of order.fees) {
+            feeTotals.amounts[leg.asset] =
+              (feeTotals.amounts[leg.asset] ?? 0) + (+leg.qty || 0)
+          }
+        }
+        krakenSpotFeeTotals.set(orderKey, feeTotals)
+        const feeAssets = Object.keys(feeTotals.amounts)
+        const feePaid =
+          feeAssets.length === 1
+            ? `${feeTotals.amounts[feeAssets[0]]}`
+            : undefined
+        const feeAsset = feeAssets.length === 1 ? feeAssets[0] : undefined
+        const feeBreakdown =
+          feeAssets.length > 1
+            ? feeAssets.map((asset) => ({
+                asset,
+                amount: `${feeTotals.amounts[asset]}`,
+              }))
+            : undefined
+        // `fee_usd_equiv` is Kraken's own running total (§2.1) — passed
+        // through directly, never summed.
+        const feePaidUsd =
+          order.fee_usd_equiv !== undefined
+            ? `${order.fee_usd_equiv}`
+            : undefined
+
         return {
           creationTime: Date.parse(order.timestamp) || Date.now(),
           eventTime: Date.parse(order.timestamp) || Date.now(),
@@ -4318,7 +4950,15 @@ class UserConnector {
           newClientOrderId: order.cl_ord_id || order.order_id || '',
           orderId: order.order_id || '',
           orderTime: Date.parse(order.timestamp) || Date.now(),
-          orderStatus: this.mapKrakenOrderStatus(order.status),
+          // v2 `executions` names this `order_status`; `status` is the REST
+          // shape and is never present here, so reading it mapped 100% of
+          // spot executions to 'NEW' — a no-op for fills in app-sh, which is
+          // why they only landed later via the fill-failsafe REST sweep
+          // (spec 007 §1.2a). `?? order.status` keeps a v1-shaped payload
+          // working.
+          orderStatus: this.mapKrakenOrderStatus(
+            order.order_status ?? order.status,
+          ),
           orderType: order.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: order.cl_ord_id || order.order_id || '',
           price: order.avg_price || order.limit_price || order.price || '0',
@@ -4329,13 +4969,17 @@ class UserConnector {
           totalTradeQuantity: order.cum_qty || order.vol_exec || '0',
           uniqueMessageId: `kraken${channel}${JSON.stringify(order)}`,
           liquidation: false,
+          feePaid,
+          feeAsset,
+          feeBreakdown,
+          feePaidUsd,
         }
       })
     }
 
     // Kraken futures fills format
     if (channel === 'fills' && msg.fills && Array.isArray(msg.fills)) {
-      return msg.fills.map((fill: any) => {
+      return chronologicalKrakenFills(msg.fills).map((fill: any) => {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
         // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
@@ -4364,6 +5008,17 @@ class UserConnector {
           totals.cost += fillQty * fillPrice
         }
         krakenFillTotals.set(orderKey, totals)
+        // Status and original size from the CUMULATIVE executed quantity paired
+        // with what is still open — the same arithmetic the `open_orders` feed
+        // below uses, so one order cannot be read two ways (spec 009 §4.2).
+        // Reading `fill.remaining_order_qty === 0` directly asked a single fill
+        // where it sat in a sequence this branch did not know, and a fill that
+        // omits the field failed the identity check and left the order
+        // PARTIALLY_FILLED at its full quantity forever.
+        const { status, total } = krakenOpenOrderFill({
+          qty: remaining,
+          filled: totals.qty,
+        })
         return {
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
@@ -4371,12 +5026,11 @@ class UserConnector {
           newClientOrderId: fill.cli_ord_id || fill.order_id || '',
           orderId: fill.order_id || '',
           orderTime: fill.time || Date.now(),
-          orderStatus:
-            fill.remaining_order_qty === 0 ? 'FILLED' : 'PARTIALLY_FILLED',
+          orderStatus: status,
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
           price: `${fillPrice}`,
-          quantity: `${totals.qty + remaining}`,
+          quantity: `${total}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
           totalQuoteTradeQuantity: `${totals.cost}`,
@@ -4468,7 +5122,13 @@ class UserConnector {
 
     const statusLower = status.toLowerCase()
 
-    // Spot statuses: pending, open, closed, canceled, expired
+    // Spot (v2 `executions`.`order_status`): pending_new, new,
+    //   partially_filled, filled, canceled — `pending_new` is intentionally
+    //   left to the trailing `return 'NEW'`. The older `pending, open,
+    //   closed, expired` set below is Kraken's REST vocabulary, kept because
+    //   the same mapper is reachable from REST-shaped payloads; it is NOT
+    //   what the user stream sends, and mistaking one for the other is how
+    //   the call site came to read `order.status` (spec 007 §3).
     // Futures statuses: placed, untriggered, cancelled, filled, partially_filled
     if (
       statusLower === 'open' ||
@@ -4510,9 +5170,44 @@ class UserConnector {
 
     // Kraken balances can come as an object with currency keys
     // or as an array of balance objects
-    let balances: { asset: string; free: string; locked: string }[] = []
+    let balances: {
+      asset: string
+      free: string
+      /**
+       * Absent for Kraken spot v2: the `balances` channel reports the TOTAL
+       * balance and no hold figure, so writing `locked: '0'` would overstate
+       * "available" on every event. main-app leaves `locked` untouched when
+       * the field is absent and the REST refresh keeps it correct.
+       */
+      locked?: string
+    }[] = []
     const maps = await this.getKrakenMaps(exchange)
-    if (Array.isArray(data)) {
+    if (
+      data &&
+      typeof data === 'object' &&
+      !Array.isArray(data) &&
+      Array.isArray((data as { data?: unknown }).data)
+    ) {
+      // Kraken SPOT WebSocket v2 `balances` channel — the message is
+      // `{channel:'balances', type:'snapshot'|'update', data:[…]}`; snapshot
+      // items carry `{asset, balance, wallets}`, update items carry
+      // `{asset, amount, balance, …}` where `balance` is the new total. Until
+      // this branch existed the whole message fell through every shape below,
+      // returned undefined, and Kraken spot accounts got NO balance updates at
+      // all: their dashboard rows only moved on the daily REST refresh
+      // (2026-09-03, 24 accounts, 0 rows updated in 30 min while every other
+      // venue was fresh).
+      balances = ((data as { data: any[] }).data as any[])
+        .filter((b) => b && (b.asset || b.currency))
+        .map((b) => ({
+          asset:
+            maps.assetNameMap.get(b.asset || b.currency || '') ||
+            b.asset ||
+            b.currency ||
+            '',
+          free: `${b.balance ?? b.available ?? 0}`,
+        }))
+    } else if (Array.isArray(data)) {
       balances = data.map((b: any) => ({
         asset:
           maps.assetNameMap.get(b.currency || b.asset || '') ||
