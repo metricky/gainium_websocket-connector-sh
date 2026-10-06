@@ -134,6 +134,7 @@ import {
   bitgetInversePlatformSymbol,
   bitgetInverseQtyUnit,
 } from './utils/bitgetInverse'
+import { chargeCost } from './utils/feeCost'
 
 const mutex = new IdMutex()
 
@@ -4167,7 +4168,7 @@ class UserConnector {
           totalTradeQuantity: data.accFillSz,
           uniqueMessageId: `${data.instId}executionReport${data.uTime}${symbol}${data.state}${data.sz}${data.px}${data.accFillSz}${data.ordType}${data.clOrdId}${data.category}`,
           liquidation: data.category === 'full_liquidation',
-          feePaid: data.fee,
+          feePaid: chargeCost(data.fee),
           feeAsset: data.feeCcy,
         }
       })
@@ -4227,6 +4228,11 @@ class UserConnector {
                 .map(([k, v]) => `${k}:${v}`)
                 .join(',')}`,
               feePaid: order.total_fees,
+              // Coinbase settles every trading fee in the product's quote
+              // currency and has no fee-currency field to say so. Without a
+              // side main-app cannot place the fee on the pair and books the
+              // estimate instead (spec 018).
+              feeSide: 'quote' as const,
             }
           }),
       )
@@ -4344,9 +4350,9 @@ class UserConnector {
           .join(',')}`,
         feeBreakdown: data.feeDetail?.map((d) => ({
           asset: d.feeCoin,
-          amount: d.fee,
+          amount: chargeCost(d.fee),
         })),
-        feePaid: primaryFeeLeg?.fee,
+        feePaid: chargeCost(primaryFeeLeg?.fee),
         feeAsset: primaryFeeLeg?.feeCoin,
       }
     })
@@ -4751,9 +4757,9 @@ class UserConnector {
           uniqueMessageId: `BitgetUtaexecutionReport${JSON.stringify(data)}`,
           feeBreakdown: data.feeDetail?.map((d) => ({
             asset: d.feeCoin,
-            amount: d.fee,
+            amount: chargeCost(d.fee),
           })),
-          feePaid: primaryFeeLeg?.fee,
+          feePaid: chargeCost(primaryFeeLeg?.fee),
           feeAsset: primaryFeeLeg?.feeCoin,
         } as ExecutionReport
       })
