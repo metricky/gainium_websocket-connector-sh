@@ -312,6 +312,22 @@ export enum CoinbaseKeysType {
   cloud = 'cloud',
 }
 
+/**
+ * The `orders` channel instTypes an OKX connection must subscribe to. A linear
+ * connection trades global perpetuals (`SWAP`) and, on OKX Europe, X-Perps,
+ * which OKX lists under `FUTURES` (`ruleType=xperp`). Subscribing to `SWAP`
+ * alone delivered no X-Perp order update at all, so every X-Perp fill reached
+ * the bot only through the REST reconcile sweep, minutes late.
+ */
+export const okxOrderInstTypes = (
+  provider: ExchangeEnum,
+): WsChannelArgInstType[] =>
+  provider === ExchangeEnum.okx
+    ? ['SPOT']
+    : provider === ExchangeEnum.okxLinear
+      ? ['SWAP', 'FUTURES']
+      : ['SWAP']
+
 export enum OKXSource {
   my = 'my',
   app = 'app',
@@ -770,8 +786,8 @@ class UserConnector {
   private coinbaseErrors: Map<string, Map<string, number>> = new Map()
   /** Kucoin errors */
   private kucoinErrors: Map<string, number> = new Map()
-  /** Rolling-window reconnect timestamps per `${exchange}:${id}`, for the
-   *  user-stream flap detector (noteReconnect). Emit-only telemetry. */
+  /** Rolling-window reconnect-BURST start times per `${exchange}:${id}`, for
+   *  the user-stream flap detector (noteReconnect). Emit-only telemetry. */
   private streamFlaps: Map<string, number[]> = new Map()
   /** Sliding-window timestamps of Binance auth-rejections (-2015/-2014/-2008 /
    *  HTTP 401) per room id. A rejected key/IP/permission never recovers by
@@ -919,7 +935,14 @@ class UserConnector {
         )
       }
       if (this.role === 'worker') {
-        const { ips, cap } = installHyperliquidIpRotation()
+        const { ips, cap } = installHyperliquidIpRotation(
+          (lateIps, lateCap) => {
+            HYPERLIQUID_USER_CAP = lateCap
+            this.logger(
+              `Worker effective HL cap=${lateCap} across ${lateIps.length} IPv4 [${lateIps.join(',')}] (IPs appeared after start-up)`,
+            )
+          },
+        )
         HYPERLIQUID_USER_CAP = cap
         this.logger(
           `Worker effective HL cap=${cap} across ${ips.length} IPv4 [${
@@ -1116,7 +1139,6 @@ class UserConnector {
     if (!this.workerId) return
     const bootEpoch = `${Date.now()}`
     const ttl = this.heartbeatSec * 3
-    const hlCap = HYPERLIQUID_USER_CAP
     try {
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:boot`,
@@ -1129,7 +1151,7 @@ class UserConnector {
       )
       await this.redisSet?.set(
         `userStream:worker:${this.workerId}:cap`,
-        `${hlCap}`,
+        `${HYPERLIQUID_USER_CAP}`,
         ttl,
       )
       await this.publishWorkerUserList(ttl)
@@ -1143,7 +1165,11 @@ class UserConnector {
         ?.set(`userStream:worker:${this.workerId}:hb`, '1', ttl)
         .catch((e) => this.logger(`Worker heartbeat tick failed: ${e}`, true))
       this.redisSet
-        ?.set(`userStream:worker:${this.workerId}:cap`, `${hlCap}`, ttl)
+        ?.set(
+          `userStream:worker:${this.workerId}:cap`,
+          `${HYPERLIQUID_USER_CAP}`,
+          ttl,
+        )
         .catch((e) => this.logger(`Worker cap publish failed: ${e}`, true))
       this.publishWorkerUserList(ttl).catch((e) =>
         this.logger(`Worker user-list publish failed: ${e}`, true),
@@ -1707,11 +1733,22 @@ class UserConnector {
       const windowMs =
         Number(process.env.USER_STREAM_FLAP_WINDOW_MS) || 10 * 60 * 1000
       const threshold = Number(process.env.USER_STREAM_FLAP_THRESHOLD) || 4
+      // Reconnects within this long of the current burst's first one are the
+      // same episode: the SDK's routine periodic reconnect sometimes stutters
+      // through 3-4 quick retries in a few seconds and then holds, which must
+      // count once, not as a flap. Measured from the burst START, so a
+      // sustained storm still opens a new burst every `burstMs` and alerts.
+      const burstMs = Number(process.env.USER_STREAM_FLAP_BURST_MS) || 30 * 1000
       const key = `${exchange}:${id}`
       const now = Date.now()
       const hits = (this.streamFlaps.get(key) ?? []).filter(
         (t) => now - t < windowMs,
       )
+      const last = hits[hits.length - 1]
+      if (last !== undefined && now - last < burstMs) {
+        this.streamFlaps.set(key, hits)
+        return
+      }
       hits.push(now)
       if (hits.length >= threshold) {
         // Reset so we alert once per burst, not on every subsequent reconnect.
@@ -2745,8 +2782,7 @@ class UserConnector {
               error: () => null,
             },
           )
-          const instType: WsChannelArgInstType =
-            api.provider === ExchangeEnum.okx ? 'SPOT' : 'SWAP'
+          const instTypes = okxOrderInstTypes(api.provider)
           const subscriptions = [
             {
               channel: 'account',
@@ -2756,7 +2792,7 @@ class UserConnector {
                 }
                 `,
             },
-            { channel: 'orders', instType },
+            ...instTypes.map((instType) => ({ channel: 'orders', instType })),
           ]
           //@ts-ignore
           client.subscribe(subscriptions)
@@ -2770,8 +2806,12 @@ class UserConnector {
               }
             }
             //@ts-ignore
-            if (msg.arg.channel === 'orders' && msg.arg.instType === instType) {
-              const orders = this.prepareOkxOrderMsg(msg.data, instType)
+            if (
+              msg.arg.channel === 'orders' &&
+              //@ts-ignore
+              instTypes.includes(msg.arg.instType)
+            ) {
+              const orders = this.prepareOkxOrderMsg(msg.data, instTypes)
               orders.forEach((o) => this.userStreamEvent(id, o))
             }
           })
@@ -4126,19 +4166,23 @@ class UserConnector {
   }
 
   private clearSymbol(s: string) {
-    return s.replace(/-SWAP$/, '')
+    // `-SWAP` for global perpetuals; the expiry suffix for OKX Europe X-Perps
+    // (`BTC-USD_UM_XPERP-310404` -> the pair id `BTC-USD_UM_XPERP`), as the
+    // price publisher does. Spot and swap ids never end in six digits.
+    return s.replace(/-SWAP$/, '').replace(/-\d{6,}$/, '')
   }
 
   private prepareOkxOrderMsg(
     msg?: OKXOrderMsg[],
-    instType?: WsChannelArgInstType,
+    instType?: WsChannelArgInstType | WsChannelArgInstType[],
   ): ExecutionReport[] {
     if (!msg) {
       return []
     }
+    const accepted = Array.isArray(instType) ? instType : [instType]
 
     return msg
-      .filter((d) => d.instType === instType)
+      .filter((d) => accepted.includes(d.instType as WsChannelArgInstType))
       .map((data) => {
         const symbol = this.clearSymbol(data.instId)
         return {

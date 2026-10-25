@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.10] - 2026-10-12
+
+### Fixed
+
+- **A user stream's routine reconnect could raise a false "connected but dead" alert.** The flap detector counted every reconnect attempt, so when a periodic reconnect stuttered through a few quick retries within a few seconds and then held, those retries alone reached the alert threshold. Reconnects within 30 seconds of the first one in a burst now count as a single episode (`USER_STREAM_FLAP_BURST_MS`). A stream that keeps reconnecting still opens a new episode every 30 seconds and is reported as before.
+
+## [1.16.9] - 2026-10-09
+
+### Fixed
+
+- **A dead market could be hidden by a live sibling on the same exchange.** Every price connector gave all its markets (spot, linear and inverse futures) one shared liveness record, so a ticker on any of them counted as a ticker on all of them, and a market whose feed died went unnoticed for as long as another market of the exchange kept delivering. Each market now has its own record. A market that delivered and then went silent is restarted after three minutes while its siblings keep delivering (KuCoin's inverse futures, a handful of contracts whose tickers legitimately pause for minutes, after thirty), and after the usual fifty seconds when every market is silent. A market that never delivered (for example one that is disabled) is not judged on its own, the connect check still asks whether any market delivered, and candle liveness is still judged across the exchange's markets, as some markets carry no candle subscription. The targeted-restart budget is now kept per market, so a sibling's data no longer resets it.
+
+## [1.16.8] - 2026-10-09
+
+### Fixed
+
+- **A Bitget price socket could stay open for many minutes without delivering a price.** Bitget markets are spread over several sockets, and the stall watchdog judged each exchange as a whole, so while the other sockets delivered, one socket that had reconnected but was never resubscribed went unnoticed until its next reconnect. Each Bitget socket is now judged on its own: one that delivers no market data for two minutes while another Bitget socket does is replaced by a fresh socket with the same subscriptions, the stall is reported at a bounded rate, and a socket that stays silent after two replacements escalates to the regular stall restart. A quiet market is not mistaken for a dead socket: nothing is flagged unless another socket is delivering, and sockets carrying fewer than 25 subscriptions are not judged.
+- **Bitget resubscriptions waited behind every other socket's.** Subscribe requests are spaced to Bitget's per-connection limit, but the spacing was enforced by one queue shared by every Bitget socket in the process, and requests queued for a socket that had since reconnected kept their place in it. After a burst of reconnects a socket could wait several minutes before its first subscription was sent. The spacing is now per connection, and requests meant for a socket that has since reopened are dropped (the reopened socket resubscribes everything itself).
+- A Bitget instrument the venue reports as no longer listed is removed from its socket's subscriptions instead of being requested again on every reconnect.
+
+## [1.16.7] - 2026-10-08
+
+### Fixed
+
+- **OKX Europe X-Perp fills were not delivered over the user stream.** X-Perps are listed by OKX under the `FUTURES` instrument type, but the user stream subscribed to and accepted only `SWAP` order updates for linear connections. No X-Perp order update reached the bot; each fill was booked only when the periodic REST reconcile found it, minutes late. Linear connections now also subscribe to `FUTURES` order updates, and an X-Perp update is forwarded under its pair id (the expiry suffix is removed, as the price feed already does). Global swap and spot streams are unchanged.
+
 ## [1.16.6] - 2026-10-05
 
 ### Fixed
