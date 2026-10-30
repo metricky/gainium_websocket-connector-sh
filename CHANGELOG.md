@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.16] - 2026-10-30
+
+### Fixed
+
+- Hyperliquid: a cancelled order whose remaining size had shrunk without a trade was reported as partly filled by the difference, so the bot booked a quantity that never traded. A cancel like that is now checked against the account's fill history on Hyperliquid, and the report carries only the fills found there (none means nothing executed). If the lookup fails, the previous report is sent and a warning is logged. Spot and perps.
+
+## [1.16.15] - 2026-10-29
+
+### Changed
+
+- Hyperliquid user-stream balancer: accounts on a worker that stops are now re-opened by the bots that use them (a targeted `serviceLog` reopen request), so the new worker's subscriber count matches the bots on each stream. A restarted worker is re-opened by its own boot broadcast. At boot, routing is seeded from the workers' published user lists.
+- Adds `src/scripts/purgeLegacyHlAssignments.ts`, a one-off removal of the older balancer routing keys.
+
+## [1.16.14] - 2026-10-29
+
+### Fixed
+
+- Kraken spot: a candle symbol requested twice at one interval was subscribed twice. At startup this is routine (candle requests arrive before the symbol maps load and are replayed once they do), and Kraken answers the repeat with "Already subscribed to one ohlc interval on this symbol", naming no symbol, which 1.16.13 read as a rejection of the whole batch and forgot its symbols. A symbol already queued or subscribed at that interval is no longer subscribed again, and that answer is no longer treated as a rejection.
+
+## [1.16.13] - 2026-10-29
+
+### Fixed
+
+- **Kraken spot candle subscribes were rejected with "Exceeded msg rate" after reconnects.** Each symbol was subscribed with its own message, and the Kraken client replays every subscribe back-to-back on reconnect, so a busy candle socket sent a burst Kraken partly refused; the refused symbols received no candles until they were requested again. Symbols requested together are now subscribed in one message (up to 100 per message, at most one message per half second).
+- Kraken futures `candles_trade_*_snapshot` frames are no longer published as candles under a `<interval>_snapshot` interval.
+
+## [1.16.12] - 2026-10-29
+
+### Fixed
+
+- **Kraken spot candles were stamped one interval late.** The v2 `ohlc` feed carries the bar's opening time in `interval_begin` and its closing time in `timestamp`; the price connector stamped candles with `timestamp`, so each live Kraken spot bar was published, and archived, under the next bar's opening time. Where such a bar met one loaded from Kraken's REST API (stamped correctly), the two collided on one time and a real bar was lost, which showed on charts as a price jump. Candles are now stamped with `interval_begin`.
+
+## [1.16.11] - 2026-10-29
+
+### Fixed
+
+- **OKX WebSocket connections used port 8443, which OKX stops accepting after 31 October 2026.** The EEA and US private streams were hardcoded to port 8443, and every other OKX socket (global and demo private streams, price and candle feeds) fell back to the `okx-api` 2.x default URLs, which also carry port 8443. All OKX WebSocket URLs now use the default port 443; host and path are unchanged.
+
 ## [1.16.10] - 2026-10-12
 
 ### Fixed
