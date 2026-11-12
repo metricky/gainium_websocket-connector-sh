@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.24] - 2026-11-11
+
+### Fixed
+
+- KuCoin spot and futures market orders now report the venue-charged fee on their filled update: the order streams carry no fee, so it is read from the order's REST record (spot) or its fills (futures) with a short bounded wait, and left out when it cannot be read
+
+## [1.16.23] - 2026-11-11
+
+### Fixed
+
+- Bybit derivatives order updates now state the fee's side (settle coin) when the venue leaves the fee currency blank, and Kraken futures fills now carry the venue-reported fee, summed per order
+
+## [1.16.22] - 2026-11-11
+
+### Fixed
+
+- Price stream: tickers of a multi-symbol frame were published one per timer tick, so the last symbols of a large frame went out noticeably later than the first and consecutive frames interleaved. A frame is now published in one pass, yielding to the event loop every 200 tickers, and frames of the same exchange are published in arrival order.
+
+## [1.16.21] - 2026-11-09
+
+### Security
+
+- Updated the qs dependency to 6.16.2 to pick up an upstream fix for a crash when serializing comma-format arrays
+
+## [1.16.20] - 2026-11-04
+
+### Fixed
+
+- Kraken Futures: an order that executed in several fills could be reported filled at only part of its size. Kraken's fill feed does not deliver an order's fills in the order they executed, sometimes seconds apart, and the order was reported filled as soon as the fill that completed it arrived, so fills delivered after that were never counted. The order's fills are now read from Kraken's fill history before it is reported filled (`KRAKEN_FILL_SETTLE_DELAY_MS`, `KRAKEN_FILL_SETTLE_TIMEOUT_MS`), and fills that arrive afterwards no longer send a second, contradictory update. A close that the exchange itself limited to a smaller size is still reported at the size actually executed. Summed fill sizes are also reported without floating-point noise.
+
+## [1.16.19] - 2026-10-31
+
+### Fixed
+
+- Hyperliquid: two identical cancel updates processed at the same moment could each start their own fill-history check and both be reported. The order is now claimed before its first check, so it is reported once.
+- Hyperliquid: Hyperliquid's fill history only keeps an account's most recent fills, so an order placed long enough ago can look fill-less even when it traded. A cancelled order's executed size is now lowered below the original-minus-remaining size only when the retained history reaches back to the order's placement; otherwise the previous size is kept and a warning is logged.
+
 ## [1.16.18] - 2026-10-31
 
 ### Fixed

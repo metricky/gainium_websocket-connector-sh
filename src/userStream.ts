@@ -21,7 +21,18 @@ import { CategoryV5 } from 'bybit-api'
 import { WebsocketClient as BybitClient } from '../bybit-custom/websocket-client'
 import { WebsocketClient as OKXClient, WsChannelArgInstType } from 'okx-api'
 import { WebsocketClientV2 as BitgetClient, BitgetInstTypeV2 } from 'bitget-api'
-import { WebsocketClient as KrakenWsClient } from '@siebly/kraken-api'
+import {
+  WebsocketClient as KrakenWsClient,
+  DerivativesClient as KrakenDerivativesClient,
+} from '@siebly/kraken-api'
+import {
+  KrakenFillTotals,
+  KrakenRestFill,
+  krakenQty,
+  mergeKrakenRestFills,
+  addKrakenFillFee,
+  krakenFillFeeFields,
+} from './utils/krakenFillSettle'
 
 /**
  * Monkeypatch @siebly/kraken-api BaseWSClient to prevent unhandled rejections
@@ -88,6 +99,7 @@ import {
   resetKrakenMaps,
 } from './utils/exchange'
 import { convertSymbol, convertSymbolToKucoin } from './utils/kucoin'
+import { createKucoinFeeSettler } from './utils/kucoinFeeSettle'
 import { ExchangeEnum, mapPaperToReal, wsLoggerOptions } from './utils/common'
 // Exchange SDKs staple the signed request / outbound auth frame onto what they
 // hand us on an error path. Everything derived from an SDK error or an SDK
@@ -120,6 +132,7 @@ import HyperliquidSymbolMap, {
 } from './utils/hyperliquidSymbols'
 import {
   fetchHyperliquidOrderFills,
+  hyperliquidFillHistoryCovers,
   HyperliquidFillParkResolver,
   ingestUserFills,
   type ParkContext,
@@ -688,10 +701,21 @@ const hyperliquidExpirableMap = new ExpirableMap<string, hl.Fill[]>(
 // The `fills` feed is incremental; the ExecutionReport contract is cumulative.
 // See prepareKrakenOrderMsg. Entries expire on their own so an order whose last
 // fill we never see cannot leak.
-const krakenFillTotals = new ExpirableMap<
-  string,
-  { qty: number; cost: number; fillIds: Set<string> }
->(60 * 60 * 1000)
+const krakenFillTotals = new ExpirableMap<string, KrakenFillTotals>(
+  60 * 60 * 1000,
+)
+
+// Settling a completed Kraken futures order on REST (see utils/krakenFillSettle):
+// how long to let the venue's fill history catch up with the fill that closed
+// the order, and how long the REST call may take before the stream's own total
+// is reported instead.
+const KRAKEN_FILL_SETTLE_DELAY_MS =
+  Number(process.env.KRAKEN_FILL_SETTLE_DELAY_MS) || 1000
+const KRAKEN_FILL_SETTLE_TIMEOUT_MS =
+  Number(process.env.KRAKEN_FILL_SETTLE_TIMEOUT_MS) || 5000
+
+/** The order's fills from REST, or `null` when the lookup failed. */
+type KrakenFillSettler = (orderId: string) => Promise<KrakenRestFill[] | null>
 
 /**
  * One `fills` message can carry a whole batch, and Kraken delivers it
@@ -2444,6 +2468,62 @@ class UserConnector {
             ExchangeEnum.kucoinInverse,
             ExchangeEnum.kucoinLinear,
           ].includes(api.provider)
+          // The order topics carry no fee; a MARKET order's FILLED report
+          // waits (bounded, one lookup per order) for the REST record's fee
+          // (utils/kucoinFeeSettle). Unresolved = reported without a fee.
+          // `sendRequest` is the client's own signer; the lib exposes no
+          // futures `/fills` method.
+          const kucoinRest = client as unknown as {
+            sendRequest: (
+              endpoint: string,
+              method: 'GET',
+              params: Record<string, string>,
+              type: 'private',
+              futures?: boolean,
+            ) => Promise<{ status: string; data: unknown }>
+          }
+          const settleKucoinFee = createKucoinFeeSettler({
+            futures,
+            getSpotOrder: async (orderId) => {
+              const res = await client.getOrderById({ id: orderId })
+              return res?.status === 'OK' ? res.data : null
+            },
+            getFuturesFills: async (orderId) => {
+              const res = await kucoinRest.sendRequest(
+                '/api/v1/fills',
+                'GET',
+                { orderId },
+                'private',
+                true,
+              )
+              return res?.status === 'OK'
+                ? (res.data as { totalNum?: number; items?: [] })
+                : null
+            },
+            log: (m) => this.logger(`${id} ${userId} ${m} ${api.provider}`),
+          })
+          const emitKucoinOrder = (
+            report: Parameters<typeof this.userStreamEvent>[1] & {
+              orderStatus?: string
+              orderType?: string
+              orderId?: string
+              totalTradeQuantity?: string
+            },
+          ) => {
+            if (
+              report.orderStatus === 'FILLED' &&
+              report.orderType === 'MARKET' &&
+              report.orderId &&
+              report.orderId !== '-1'
+            ) {
+              settleKucoinFee(
+                report.orderId,
+                Number(report.totalTradeQuantity),
+              ).then((fee) => this.userStreamEvent(id, { ...report, ...fee }))
+              return
+            }
+            this.userStreamEvent(id, report)
+          }
           const closeOrder = futures
             ? await client.ws().futuresOrder((streamMsg) => {
                 const symbols =
@@ -2452,7 +2532,7 @@ class UserConnector {
                     : this.kucoinSymbols.usdm.map((s) => s.symbol)
                 const symbol = convertSymbol(streamMsg.symbol)
                 if (symbols.includes(symbol)) {
-                  this.userStreamEvent(id, {
+                  emitKucoinOrder({
                     ...streamMsg,
                     creationTime: streamMsg.eventTime || +new Date(),
                     newClientOrderId: streamMsg.newClientOrderId || '',
@@ -2468,7 +2548,7 @@ class UserConnector {
                 }
               }, handleError)
             : await client.ws().order((streamMsg) => {
-                this.userStreamEvent(id, {
+                emitKucoinOrder({
                   ...streamMsg,
                   creationTime: streamMsg.eventTime || +new Date(),
                   newClientOrderId: streamMsg.newClientOrderId || '',
@@ -3595,6 +3675,45 @@ class UserConnector {
 
           client.subscribe(krakenTopics, wsKey)
 
+          // REST read of a completed futures order's fills, so its FILLED
+          // report carries every fill and not only those the feed has
+          // delivered so far (utils/krakenFillSettle). `null` on any failure:
+          // the stream's own total is reported, as before.
+          const restClient = isFutures
+            ? new KrakenDerivativesClient({
+                apiKey: api.key,
+                apiSecret: api.secret,
+                ...(isDemo && { testnet: true }),
+              })
+            : undefined
+          const settleFills: KrakenFillSettler | undefined = restClient
+            ? async (orderId) => {
+                await sleep(KRAKEN_FILL_SETTLE_DELAY_MS)
+                let timer: NodeJS.Timeout | undefined
+                try {
+                  const res = await Promise.race([
+                    restClient.getFills(),
+                    new Promise<never>((_, reject) => {
+                      timer = setTimeout(
+                        () => reject(new Error('timeout')),
+                        KRAKEN_FILL_SETTLE_TIMEOUT_MS,
+                      )
+                    }),
+                  ])
+                  return (res.fills ?? []).filter((f) => f.order_id === orderId)
+                } catch (e) {
+                  this.logger(
+                    `${id} ${userId} Kraken fill settle for ${orderId} failed, reporting the stream total: ${
+                      e instanceof Error ? e.message : safeStringify(e)
+                    } ${api.provider}`,
+                  )
+                  return null
+                } finally {
+                  clearTimeout(timer)
+                }
+              }
+            : undefined
+
           client.on('message', async (msg: any) => {
             const ref = isFutures ? msg.feed : msg.channel
             if (ref.endsWith('_snapshot')) {
@@ -3611,6 +3730,7 @@ class UserConnector {
                 msg,
                 ref,
                 api.provider as ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
+                settleFills,
               )
               orders.forEach((order) => this.userStreamEvent(id, order))
             }
@@ -4454,7 +4574,18 @@ class UserConnector {
         // populated today, but this is a follow-up: capture `cumFeeDetail`'s
         // shape and migrate before Bybit stops filling the old fields.
         feePaid: data.cumExecFee,
-        feeAsset: data.feeCurrency,
+        // Bybit fills `feeCurrency` for spot only; on linear/inverse it is
+        // "". A blank currency cannot be placed on the pair, so consumers
+        // fell back to the estimate. Derivatives fees settle in the settle
+        // coin — quote for linear, base for inverse — the same rule the
+        // REST mapper (exchange-connector `orderFee`) applies.
+        ...(data.feeCurrency
+          ? { feeAsset: data.feeCurrency }
+          : category === 'linear'
+            ? { feeSide: 'quote' as const }
+            : category === 'inverse'
+              ? { feeSide: 'base' as const }
+              : {}),
       }))
   }
 
@@ -4750,9 +4881,13 @@ class UserConnector {
         if (this.hlHistoryDeferred.has(cloid)) {
           continue
         }
+        // Claimed before the first await: an identical frame arriving while
+        // this lookup is in flight must not start a second report (§4.3).
+        this.hlHistoryDeferred.add(cloid)
         const history = await this.hlOrderFillHistory(order, ctx.user, 1)
         if (history) {
-          out.push(this.buildHyperliquidExecutionReport(order, history, true))
+          this.hlHistoryDeferred.delete(cloid)
+          out.push(this.hlHistoryReport(order, history))
           continue
         }
         // Inconclusive: retry off this batch before trusting `origSz − sz`.
@@ -4798,10 +4933,7 @@ class UserConnector {
         await sleep(this.hlHistoryRetryDelayMs * 2 ** (attempt - 2))
         const history = await this.hlOrderFillHistory(order, user, attempt)
         if (history) {
-          this.userStreamEvent(
-            roomId,
-            this.buildHyperliquidExecutionReport(order, history, true),
-          )
+          this.userStreamEvent(roomId, this.hlHistoryReport(order, history))
           return
         }
       }
@@ -4819,16 +4951,36 @@ class UserConnector {
   }
 
   /**
-   * The order's fills from HL's fill history over its lifetime, or `null`
-   * when the lookup failed — the caller then retries it (spec 020 §4.3).
+   * The report for a shrunk cancel whose history was read. Only a history that
+   * reaches back to the order's placement may lower the executed size below
+   * `origSz − sz`; one that does not is no evidence either way, so the pre-020
+   * report is kept, warned (spec 020 §4.6).
+   */
+  private hlHistoryReport(
+    order: hl.OrderStatus<hl.Order>,
+    history: { fills: hl.Fill[]; covered: boolean },
+  ): UserDataStreamEvent & { uniqueMessageId?: string } {
+    if (history.covered) {
+      return this.buildHyperliquidExecutionReport(order, history.fills, true)
+    }
+    logger.warn(
+      `[hl-history] fill history for cloid ${order.order.cloid} (oid ${order.order.oid}, ${order.status}) does not reach back to its placement at ${order.order.timestamp}; reporting origSz - sz as executed`,
+    )
+    return this.buildHyperliquidExecutionReport(order, [])
+  }
+
+  /**
+   * The order's fills from HL's fill history over its lifetime, and whether
+   * that history covers its whole life (§4.6), or `null` when the lookup
+   * failed — the caller then retries it (spec 020 §4.3).
    */
   private async hlOrderFillHistory(
     order: hl.OrderStatus<hl.Order>,
     user: string,
     attempt: number,
-  ): Promise<hl.Fill[] | null> {
+  ): Promise<{ fills: hl.Fill[]; covered: boolean } | null> {
     try {
-      return await fetchHyperliquidOrderFills(
+      const fills = await fetchHyperliquidOrderFills(
         (start, end) => this.hlFetchFillsPage(user, start, end),
         {
           oid: order.order.oid,
@@ -4836,6 +4988,16 @@ class UserConnector {
           endTime: order.statusTimestamp + HL_FILL_HISTORY_SLACK_MS,
         },
       )
+      const shrunk = +order.order.origSz - +order.order.sz
+      const filled = fills.reduce((a, f) => a + +f.sz, 0)
+      // Fills that already account for the shrink lower nothing: no probe.
+      const covered =
+        filled >= shrunk - Math.max(shrunk * 1e-9, 1e-12) ||
+        hyperliquidFillHistoryCovers(
+          await this.hlFetchFillsPage(user, 0, Date.now()),
+          order.order.timestamp,
+        )
+      return { fills, covered }
     } catch (err) {
       const msg = err instanceof Error ? err.message : `${err}`
       logger.warn(
@@ -5153,6 +5315,7 @@ class UserConnector {
     msg: any,
     channel: string,
     exchange: ExchangeEnum.kraken | ExchangeEnum.krakenUsdm,
+    settleFills?: KrakenFillSettler,
   ): Promise<ExecutionReport[]> {
     if (!msg) {
       return []
@@ -5256,7 +5419,8 @@ class UserConnector {
 
     // Kraken futures fills format
     if (channel === 'fills' && msg.fills && Array.isArray(msg.fills)) {
-      return chronologicalKrakenFills(msg.fills).map((fill: any) => {
+      const reports: ExecutionReport[] = []
+      for (const fill of chronologicalKrakenFills(msg.fills) as any[]) {
         const symbol =
           maps.wsnameToNormalized.get(fill.instrument) || fill.instrument || ''
         // Kraken's `fills` feed reports THIS fill only (`qty`/`price`), but
@@ -5279,12 +5443,28 @@ class UserConnector {
           fillIds: new Set<string>(),
         }
         const fillId = `${fill.fill_id ?? fill.seq ?? ''}`
-        if (!totals.fillIds.has(fillId)) {
+        const isNewFill = !totals.fillIds.has(fillId)
+        if (isNewFill) {
           totals.fillIds.add(fillId)
           totals.qty += fillQty
           totals.cost += fillQty * fillPrice
+          addKrakenFillFee(totals, fill)
         }
         krakenFillTotals.set(orderKey, totals)
+        // The order has already been reported FILLED. Whatever arrives now is
+        // an EARLIER execution delivered late (the remaining-0 fill is the last
+        // one executed); its `remaining_order_qty` is stale, and a second
+        // report would either reopen the order or, as FILLED, make main-app
+        // chase the difference with another reduce-only order. The REST settle
+        // below should already have counted it — say so if it had not.
+        if (totals.settled) {
+          if (isNewFill && totals.settled === 'reported') {
+            logger.warn(
+              `KRAKEN-LATE-FILL ${orderKey} ${fill.cli_ord_id ?? ''} fill ${fillId} qty ${fillQty} arrived after FILLED was reported; the reported total missed it (now ${krakenQty(totals.qty)})`,
+            )
+          }
+          continue
+        }
         // Status and original size from the CUMULATIVE executed quantity paired
         // with what is still open — the same arithmetic the `open_orders` feed
         // below uses, so one order cannot be read two ways (spec 009 §4.2).
@@ -5292,11 +5472,37 @@ class UserConnector {
         // where it sat in a sequence this branch did not know, and a fill that
         // omits the field failed the identity check and left the order
         // PARTIALLY_FILLED at its full quantity forever.
-        const { status, total } = krakenOpenOrderFill({
+        let { status, total } = krakenOpenOrderFill({
           qty: remaining,
           filled: totals.qty,
         })
-        return {
+        // Remaining 0 says this was the last fill EXECUTED, not that every
+        // earlier one has been delivered — the feed reorders them, sometimes by
+        // seconds, and main-app books the close on the first FILLED only. Read
+        // the order's fills from REST before reporting it (see
+        // utils/krakenFillSettle). Marked first so fills of this order that
+        // arrive while the lookup is out are absorbed into the total, not
+        // emitted with their stale remaining.
+        if (status === 'FILLED' && settleFills && orderKey) {
+          totals.settled = 'settling'
+          const restFills = await settleFills(orderKey)
+          if (restFills) {
+            const added = mergeKrakenRestFills(totals, orderKey, restFills)
+            if (added) {
+              logger.info(
+                `Kraken ${orderKey} ${fill.cli_ord_id ?? ''}: ${added} fill(s) the stream had not delivered were found on REST; executed ${krakenQty(totals.qty)}`,
+              )
+            }
+          }
+          ;({ status, total } = krakenOpenOrderFill({
+            qty: remaining,
+            filled: totals.qty,
+          }))
+        }
+        if (status === 'FILLED') {
+          totals.settled = 'reported'
+        }
+        reports.push({
           creationTime: fill.time || Date.now(),
           eventTime: fill.time || Date.now(),
           eventType: 'executionReport',
@@ -5307,15 +5513,17 @@ class UserConnector {
           orderType: fill.order_type === 'limit' ? 'LIMIT' : 'MARKET',
           originalClientOrderId: fill.cli_ord_id || fill.order_id || '',
           price: `${fillPrice}`,
-          quantity: `${total}`,
+          quantity: `${krakenQty(total)}`,
           side: fill.buy ? 'BUY' : 'SELL',
           symbol,
           totalQuoteTradeQuantity: `${totals.cost}`,
-          totalTradeQuantity: `${totals.qty}`,
+          totalTradeQuantity: `${krakenQty(totals.qty)}`,
           uniqueMessageId: `kraken${channel}${JSON.stringify(fill)}`,
           liquidation: false,
-        }
-      })
+          ...krakenFillFeeFields(totals),
+        })
+      }
+      return reports
     }
 
     // Kraken futures open_orders format
